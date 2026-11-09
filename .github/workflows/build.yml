@@ -1,24 +1,42 @@
+
 name: Build APK
 on:
   workflow_dispatch:
   push:
     branches: [main]
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Unpack project.zip (first run only)
+        run: |
+          if [ -f project.zip ]; then
+            unzip -q -o project.zip
+            rm project.zip
+            git config user.name "github-actions"
+            git config user.email "actions@users.noreply.github.com"
+            git add -A
+            git commit -m "Add HTML2MP4 project"
+            git push
+          fi
       - uses: actions/setup-java@v4
+        if: hashFiles('gradlew') != ''
         with:
           distribution: temurin
           java-version: 17
       - name: Accept Android SDK licenses
+        if: hashFiles('gradlew') != ''
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
       - name: Build
+        if: hashFiles('gradlew') != ''
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace
       - uses: actions/upload-artifact@v4
+        if: hashFiles('gradlew') != ''
         with:
           name: HTML2MP4-apk
           path: app/build/outputs/apk/debug/app-debug.apk
