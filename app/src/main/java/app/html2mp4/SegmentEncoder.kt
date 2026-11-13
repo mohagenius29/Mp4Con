@@ -35,6 +35,9 @@ class SegmentEncoder(private val w: Int, private val h: Int, fps: Int, private v
     private var inputSurface: Surface
     private var program = 0
     private var tex = 0
+    private var aPos = 0
+    private var aTex = 0
+    private var texReady = false
     private val quad: java.nio.FloatBuffer = ByteBuffer.allocateDirect(16 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(-1f, -1f, 0f, 1f, 1f, -1f, 1f, 1f, -1f, 1f, 0f, 0f, 1f, 1f, 1f, 0f)); position(0)
     }
@@ -73,6 +76,7 @@ class SegmentEncoder(private val w: Int, private val h: Int, fps: Int, private v
         program = GLES20.glCreateProgram()
         GLES20.glAttachShader(program, shader(GLES20.GL_VERTEX_SHADER, vs)); GLES20.glAttachShader(program, shader(GLES20.GL_FRAGMENT_SHADER, fs))
         GLES20.glLinkProgram(program)
+        aPos = GLES20.glGetAttribLocation(program, "p"); aTex = GLES20.glGetAttribLocation(program, "t")
         val t = IntArray(1); GLES20.glGenTextures(1, t, 0); tex = t[0]
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
         for ((k, vv) in listOf(GLES20.GL_TEXTURE_MIN_FILTER to GLES20.GL_LINEAR, GLES20.GL_TEXTURE_MAG_FILTER to GLES20.GL_LINEAR,
@@ -89,10 +93,11 @@ class SegmentEncoder(private val w: Int, private val h: Int, fps: Int, private v
     fun encode(bmp: Bitmap, ptsNs: Long) {
         GLES20.glUseProgram(program)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
-        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
-        val p = GLES20.glGetAttribLocation(program, "p"); val t = GLES20.glGetAttribLocation(program, "t")
-        quad.position(0); GLES20.glVertexAttribPointer(p, 2, GLES20.GL_FLOAT, false, 16, quad); GLES20.glEnableVertexAttribArray(p)
-        quad.position(2); GLES20.glVertexAttribPointer(t, 2, GLES20.GL_FLOAT, false, 16, quad); GLES20.glEnableVertexAttribArray(t)
+        // allocate the texture once, then only overwrite its pixels (cheaper than re-allocating every frame)
+        if (texReady) GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, bmp)
+        else { GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0); texReady = true }
+        quad.position(0); GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, quad); GLES20.glEnableVertexAttribArray(aPos)
+        quad.position(2); GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, quad); GLES20.glEnableVertexAttribArray(aTex)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         EGLExt.eglPresentationTimeANDROID(dpy, surf, ptsNs)
         EGL14.eglSwapBuffers(dpy, surf)

@@ -18,20 +18,17 @@ data class RenderConfig(
     val fps: Int,
     val hideOverlays: Boolean,
     val autoClick: Boolean,
-    /** 0 = auto (stop when audio ends + tail). */
+    /** 0 = auto (stop when the page's own audio element ends + tail, else [fallbackDurationSec]). */
     val manualDurationSec: Double,
     val tailSec: Double = 0.4,
     val maxDurationSec: Double = 600.0,
-    /** Used when there is no audio and no manual duration. */
+    /** Used when the page has no audio to measure and no manual duration was given. */
     val fallbackDurationSec: Double = 10.0,
-    /** Optional uploaded soundtrack (mp3/wav/m4a/...), mixed into the video from t=0. */
-    val audioFile: File? = null,
-    val audioDurSec: Double = 0.0,
     /** Turbo: wait 1 vsync instead of 2 before each capture (faster; set false if you ever see repeated frames). */
     val turbo: Boolean = true,
 )
 
-enum class Phase { Idle, Preparing, Rendering, Audio, Muxing, Done, Error }
+enum class Phase { Idle, Preparing, Rendering, Muxing, Done, Error }
 
 data class UiState(
     val phase: Phase = Phase.Idle,
@@ -54,10 +51,6 @@ object RenderState {
     val ui: StateFlow<UiState> = _ui
     fun update(f: (UiState) -> UiState) = _ui.update(f)
     fun reset() { _ui.value = UiState() }
-    /** Non-fatal problem found while rendering (e.g. no sound captured); shown next to "Saved". */
-    @Volatile var warning: String? = null
-    /** Whether the finished MP4 contains an audio track. */
-    @Volatile var hasSound: Boolean = false
 }
 
 class RenderError(message: String, cause: Throwable? = null) : Exception(message, cause)

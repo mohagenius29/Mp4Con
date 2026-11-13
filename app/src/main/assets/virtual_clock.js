@@ -1,10 +1,12 @@
-/* HTML2MP4 virtual clock. __W__ is replaced by the output width. Injected before any page script. */
+/* HTML2MP4 virtual clock. __W__ is replaced by the output width. Injected before any page script.
+   Audio elements are only stubbed so the page's own logic keeps running and so the app can tell when the audio ends;
+   no sound is captured. */
 (function () {
   if (window.__vc) return;
   var RD = Date;
   var vc = window.__vc = { t: 0, prev: 0, epoch: RD.now(), raf: [], rafId: 0, timers: [], timerId: 0,
-    anims: new WeakMap(), synced: false, audios: [], log: [], errors: [], everPlayed: false,
-    isReady: false, cfg: null, clicked: new WeakSet(), durByKey: {}, webAudio: false };
+    anims: new WeakMap(), synced: false, audios: [], errors: [], everPlayed: false,
+    isReady: false, cfg: null, clicked: new WeakSet(), durByKey: {} };
 
   // ---- fixed device pixel ratio + viewport so CSS px == output px
   try { Object.defineProperty(window, 'devicePixelRatio', { get: function () { return 1; }, configurable: true }); } catch (e) {}
@@ -48,46 +50,11 @@
   var P = HTMLMediaElement.prototype, S = '__vs';
   var nativeDur = Object.getOwnPropertyDescriptor(P, 'duration').get;
 
-  // ---- blob: URLs made by the page (audio rebuilt from base64, fetched, generated...): keep a short key and stream the bytes to the app
-  vc.blobKeys = {};
-  try {
-    var origCOU = URL.createObjectURL.bind(URL);
-    URL.createObjectURL = function (b) {
-      var u = origCOU(b);
-      try {
-        var ty = (b && b.type) || '';
-        if (b && b.size && b.size < 80e6 && (/^(audio|video)\//.test(ty) || ty === '' || ty === 'application/octet-stream')) {
-          var fr = new FileReader();
-          fr.onload = function () {
-            var res = String(fr.result);
-            vc.blobKeys[u] = res.slice(0, 60);
-            if (window.__h2m) {
-              var b64 = res.slice(res.indexOf(',') + 1), N = 400000, n = Math.max(1, Math.ceil(b64.length / N));
-              for (var q = 0; q < n; q++) window.__h2m.chunk(u, q, n, ty, b64.substr(q * N, N));
-            }
-          };
-          fr.readAsDataURL(b);
-        }
-      } catch (e) { vc.errors.push(String(e)); }
-      return u;
-    };
-  } catch (e) {}
-
-  // ---- Web Audio cannot be captured: flag it so the app can warn instead of silently producing a mute video
-  ['AudioContext', 'webkitAudioContext'].forEach(function (n) {
-    try {
-      var O = window[n]; if (!O) return;
-      var W = function () { vc.webAudio = true; return new (Function.prototype.bind.apply(O, [null].concat([].slice.call(arguments))))(); };
-      W.prototype = O.prototype; window[n] = W;
-    } catch (e) {}
-  });
-
-  // duration: native if the element loaded, else the app's probe of the embedded file
+  // duration: native if the element loaded, else the app's probe of the embedded file (only used to know when the video should end)
   function durOf(el) {
     var d = nativeDur.call(el);
     if (isFinite(d) && d > 0) return d;
     var s = el.currentSrc || el.src || '';
-    if (s.indexOf('blob:') === 0 && vc.blobKeys[s]) s = vc.blobKeys[s];
     var k = s.indexOf('data:') === 0 ? s.slice(0, 60) : s;
     return vc.durByKey[k] || d;
   }
@@ -180,19 +147,12 @@
     return 1;
   };
   vc.info = function () { return { w: innerWidth, h: innerHeight, dpr: 1, audios: vc.audios.length }; };
-  vc.audioMeta = function () {
-    return vc.audios.map(function (el, i) { var s = el.currentSrc || el.src || '';
-      return { id: i, src: s.indexOf('data:') === 0 ? s.slice(0, 60) : s, key: vc.blobKeys[s] || '', dur: durOf(el) || 0 }; });
-  };
-
-  vc.logSlice = function (from) { return { n: vc.log.length, rows: vc.log.slice(from) }; };
-
   /* Advance to absolute virtual time t (ms) for frame index f. Returns a small state object. */
   vc.step = function (t, f) {
     var dt = Math.max(0, t - vc.t); vc.prev = vc.t; vc.t = t;
     var playing = 0, played = 0, ended = 0, prog = -1, events = [];
     for (var i = 0; i < vc.audios.length; i++) {
-      var el = vc.audios[i], s = el[S], dur = durOf(el), before = s.pos, was = s.playing;
+      var el = vc.audios[i], s = el[S], dur = durOf(el), was = s.playing;
       if (was && dt > 0) {
         s.pos += dt / 1000 * s.rate;
         if (isFinite(dur) && s.pos >= dur) {
@@ -200,7 +160,6 @@
           else { s.pos = dur; s.playing = false; s.ended = true; events.push([el, 'ended']); }
         } else events.push([el, 'timeupdate']);
       }
-      vc.log.push([f, i, before, s.pos, was ? 1 : 0]);
       if (s.playing) playing++;
       if (s.played) played++;
       if (s.ended) ended++;

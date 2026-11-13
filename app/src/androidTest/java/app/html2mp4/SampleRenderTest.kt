@@ -10,6 +10,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -17,8 +18,8 @@ import org.junit.runner.RunWith
 import java.io.File
 
 /**
- * Renders the bundled 5 s sample (canvas + WebGL + CSS animation + audio with varying playbackRate) and checks:
- * duration ≈ audio length + 0.4 s tail, an audio track exists, and frames at different times differ.
+ * Renders the bundled 5 s sample (canvas + WebGL + CSS animation; its audio clip only decides the length) and checks:
+ * duration ≈ audio length + 0.4 s tail, the MP4 has NO audio track (video only), and frames at different times differ.
  * Run on a real device: ./gradlew connectedDebugAndroidTest   (keep the screen unlocked)
  */
 @RunWith(AndroidJUnit4::class)
@@ -40,7 +41,7 @@ class SampleRenderTest {
                 mmr.setDataSource(ctx, uri)
                 val ms = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)!!.toLong()
                 assertTrue("duration $ms ms should be ~5000 ms", ms in 4600..5600)
-                assertEquals("yes", mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO))
+                assertNotEquals("yes", mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO))
                 assertEquals("720", mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH))
                 val a = mmr.getFrameAtTime(500_000, MediaMetadataRetriever.OPTION_CLOSEST)!!
                 val b = mmr.getFrameAtTime(2_500_000, MediaMetadataRetriever.OPTION_CLOSEST)!!

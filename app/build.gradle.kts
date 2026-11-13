@@ -11,11 +11,9 @@ android {
         applicationId = "app.html2mp4"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "3.0"
+        versionCode = 4
+        versionName = "4.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        // The maintained ffmpeg-kit fork only publishes arm64-v8a.
-        ndk { abiFilters += listOf("arm64-v8a") }
     }
     buildTypes {
         release {
@@ -39,19 +37,9 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.webkit:webkit:1.12.1")
-    // in-app smooth preview player
+    // in-app live preview player
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-
-    // ffmpeg: if you drop the paid Full-GPL AAR (has the `rubberband` filter) into app/libs it is used
-    // INSTEAD of the Maven Free build. Both expose the same com.arthenica.ffmpegkit API.
-    val localAar = file("libs/ffmpeg-kit-full-gpl.aar")
-    if (localAar.exists()) {
-        implementation(files(localAar))
-        implementation("com.arthenica:smart-exception-java:0.2.1")
-    } else {
-        implementation("dev.ffmpegkit-maintained:ffmpeg-kit-free-71:7.1.5")
-    }
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

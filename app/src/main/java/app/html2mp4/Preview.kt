@@ -20,22 +20,18 @@ import kotlinx.coroutines.flow.update
 import java.io.File
 
 /**
- * Finished preview chunks (a few seconds of rendered video, already muxed with their audio) are published here by the
+ * Finished preview chunks (a few seconds of rendered video) are published here by the
  * [Engine] while it renders; [PreviewController] queues them into a player.
  */
 object PreviewFeed {
     class Chunk(val file: File, val durationSec: Double)
-
-    /** Uploaded soundtrack of the current render; the preview plays it in sync with the video. */
-    @Volatile var extAudio: File? = null
 
     private val _chunks = MutableStateFlow<List<Chunk>>(emptyList())
     val chunks: StateFlow<List<Chunk>> = _chunks
 
     fun dir(ctx: Context): File = File(ctx.cacheDir, "preview").apply { mkdirs() }
 
-    fun reset(ctx: Context, ext: File? = null): File {
-        extAudio = ext
+    fun reset(ctx: Context): File {
         _chunks.value = emptyList()
         dir(ctx).listFiles()?.forEach { it.delete() }
         return dir(ctx)
@@ -62,8 +58,6 @@ class PreviewController(ctx: Context) {
     }
 
     private val player: ExoPlayer = ExoPlayer.Builder(ctx).build()
-    private val ext: ExoPlayer = ExoPlayer.Builder(ctx).build()
-    private var extLoaded: File? = null
     private val handler = Handler(Looper.getMainLooper())
     private val planned = ArrayList<Double>()
     private val win = Timeline.Window()
@@ -93,25 +87,9 @@ class PreviewController(ctx: Context) {
     fun setSurface(sv: SurfaceView) { player.setVideoSurfaceView(sv) }
     fun clearSurface(sv: SurfaceView) { player.clearVideoSurfaceView(sv) }
 
-    fun setAppResumed(r: Boolean) { appResumed = r; if (!r) { player.playWhenReady = false; ext.playWhenReady = false } }
+    fun setAppResumed(r: Boolean) { appResumed = r; if (!r) player.playWhenReady = false }
 
-    /** Keeps the uploaded soundtrack playing exactly while (and where) the preview video plays. */
-    private fun syncExt() {
-        val want = if (finalMode) null else PreviewFeed.extAudio
-        if (want != extLoaded) {
-            extLoaded = want
-            if (want == null) { ext.stop(); ext.clearMediaItems() }
-            else { ext.setMediaItem(MediaItem.fromUri(Uri.fromFile(want))); ext.prepare(); ext.playWhenReady = false }
-        }
-        if (want == null) return
-        if (player.isPlaying && appResumed) {
-            val target = (globalPos() * 1000).toLong()
-            if (kotlin.math.abs(ext.currentPosition - target) > 250) ext.seekTo(target)
-            ext.playWhenReady = true
-        } else ext.playWhenReady = false
-    }
-
-    fun release() { handler.removeCallbacksAndMessages(null); player.release(); ext.release() }
+    fun release() { handler.removeCallbacksAndMessages(null); player.release() }
 
     // ---------- session control ----------
     fun resetSession() {
@@ -177,14 +155,13 @@ class PreviewController(ctx: Context) {
 
     private fun update() {
         playing = player.isPlaying
-        syncExt()
         if (finalMode) {
             posSec = globalPos()
             bufferedSec = if (player.duration != C.TIME_UNSET) player.duration / 1000.0 else bufferedSec
             return
         }
         val ui = RenderState.ui.value
-        val rendering = ui.phase == Phase.Preparing || ui.phase == Phase.Rendering || ui.phase == Phase.Audio || ui.phase == Phase.Muxing
+        val rendering = ui.phase == Phase.Preparing || ui.phase == Phase.Rendering || ui.phase == Phase.Muxing
         if (planned.isEmpty()) { status = if (rendering) "Rendering first preview chunk…" else ""; return }
 
         var rendered = 0.0

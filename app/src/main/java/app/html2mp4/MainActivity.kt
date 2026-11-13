@@ -8,8 +8,6 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
-import android.media.MediaMetadataRetriever
-import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -70,26 +68,8 @@ class MainActivity : ComponentActivity(), RenderHost {
     private var htmlFile by mutableStateOf<File?>(null)
     private var htmlName by mutableStateOf("")
     private var rig: Rig? = null
-    private var audioFile by mutableStateOf<File?>(null)
-    private var audioName by mutableStateOf("")
-    private var audioDur by mutableDoubleStateOf(0.0)
     private lateinit var preview: PreviewController
-    private var auditioner: MediaPlayer? = null
-    private var auditioning by mutableStateOf(false)
-
-    private fun stopAudition() { runCatching { auditioner?.release() }; auditioner = null; auditioning = false }
-    private fun toggleAudition() {
-        if (auditioning) { stopAudition(); return }
-        val f = audioFile ?: return
-        runCatching {
-            auditioner = MediaPlayer().apply {
-                setDataSource(f.absolutePath); prepare(); start()
-                setOnCompletionListener { stopAudition() }
-            }
-            auditioning = true
-        }.onFailure { stopAudition(); Toast.makeText(this, "Cannot play this audio file.", Toast.LENGTH_LONG).show() }
-    }
-    private fun clearFile() { stopAudition(); htmlFile = null; htmlName = ""; RenderState.reset() }
+    private fun clearFile() { htmlFile = null; htmlName = ""; RenderState.reset() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -105,7 +85,7 @@ class MainActivity : ComponentActivity(), RenderHost {
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); handleIntent(intent) }
     override fun onResume() { super.onResume(); _resumed.value = true; preview.setAppResumed(true) }
     override fun onPause() { _resumed.value = false; preview.setAppResumed(false); super.onPause() }
-    override fun onDestroy() { if (RenderController.host.value === this) RenderController.host.value = null; preview.release(); stopAudition(); super.onDestroy() }
+    override fun onDestroy() { if (RenderController.host.value === this) RenderController.host.value = null; preview.release(); super.onDestroy() }
 
     @Deprecated("Deprecated in Java")
     override fun onTrimMemory(level: Int) {
@@ -125,25 +105,6 @@ class MainActivity : ComponentActivity(), RenderHost {
 
     private fun displayName(uri: Uri): String? = contentResolver.query(uri, null, null, null, null)?.use { c ->
         if (c.moveToFirst()) c.getColumnIndex(OpenableColumns.DISPLAY_NAME).let { if (it >= 0) c.getString(it) else null } else null
-    }
-
-    /** Copies an uploaded soundtrack into app storage and reads its duration. */
-    private fun importAudio(uri: Uri) = lifecycleScope.launch {
-        val res = withContext(Dispatchers.IO) {
-            runCatching {
-                val name = displayName(uri) ?: "soundtrack"
-                val dir = File(filesDir, "audio_in").apply { mkdirs(); listFiles()?.forEach { it.delete() } }
-                val dst = File(dir, name.replace(Regex("[^A-Za-z0-9._-]"), "_"))
-                contentResolver.openInputStream(uri)!!.use { i -> dst.outputStream().use { o -> i.copyTo(o) } }
-                val mmr = MediaMetadataRetriever()
-                val ms = try { mmr.setDataSource(dst.absolutePath); mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull() } finally { mmr.release() }
-                Triple(name, dst, (ms ?: 0.0) / 1000.0)
-            }.getOrNull()
-        }
-        if (res == null || res.third <= 0.0) {
-            Toast.makeText(this@MainActivity, "Could not read that audio file.", Toast.LENGTH_LONG).show(); return@launch
-        }
-        audioName = res.first; audioFile = res.second; audioDur = res.third
     }
 
     private fun importUri(uri: Uri) = lifecycleScope.launch {
@@ -234,7 +195,7 @@ class MainActivity : ComponentActivity(), RenderHost {
     @Composable
     private fun App() {
         val ui by RenderState.ui.collectAsStateWithLifecycle()
-        val busy = ui.phase == Phase.Preparing || ui.phase == Phase.Rendering || ui.phase == Phase.Audio || ui.phase == Phase.Muxing
+        val busy = ui.phase == Phase.Preparing || ui.phase == Phase.Rendering || ui.phase == Phase.Muxing
         LaunchedEffect(ui.phase, ui.outUri) {
             when (ui.phase) {
                 Phase.Done -> ui.outUri?.let { preview.showFinal(it, if (ui.fps > 0) ui.frame.toDouble() / ui.fps else 0.0) }
@@ -270,14 +231,12 @@ class MainActivity : ComponentActivity(), RenderHost {
 
         BackHandler(enabled = htmlFile != null) { clearFile() }
 
-        val pickAudio = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) { stopAudition(); importAudio(u) } }
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) importUri(u) }
         val start = {
             val f = htmlFile
             if (f != null) {
-                stopAudition()
                 val (w, h) = dims(res, orient)
-                RenderController.start(this, RenderConfig(f, htmlName, w, h, fps, hide, click, dur.toDoubleOrNull() ?: 0.0, audioFile = audioFile, audioDurSec = audioDur, turbo = turbo))
+                RenderController.start(this, RenderConfig(f, htmlName, w, h, fps, hide, click, dur.toDoubleOrNull() ?: 0.0, turbo = turbo))
             }
         }
         val perm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { start() }
@@ -296,7 +255,7 @@ class MainActivity : ComponentActivity(), RenderHost {
                 if (htmlFile != null) TextButton(onClick = { clearFile() }) { Text("← Back") } else Spacer(Modifier.width(8.dp))
                 Column(Modifier.weight(1f)) {
                     Text("HTML2MP4", style = MaterialTheme.typography.titleLarge)
-                    Text(if (htmlFile == null) "Turn an HTML animation into an MP4" else htmlName, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                    Text(if (htmlFile == null) "Turn an HTML animation into an MP4 (video only, no audio)" else htmlName, style = MaterialTheme.typography.bodySmall, maxLines = 1)
                 }
             }
 
@@ -310,21 +269,6 @@ class MainActivity : ComponentActivity(), RenderHost {
                     Section("Animation") {
                         Text(htmlName)
                         OutlinedButton(onClick = { pick.launch(arrayOf("text/html", "text/plain", "application/xhtml+xml")) }) { Text("Change file") }
-                    }
-                }
-
-                Section("Soundtrack (optional)") {
-                    if (audioFile == null) {
-                        Text("Upload an mp3 / wav / m4a. It is mixed into the video and plays in the live preview.", style = MaterialTheme.typography.bodySmall)
-                        Button(onClick = { pickAudio.launch(arrayOf("audio/*")) }) { Text("Upload audio") }
-                    } else {
-                        Text("$audioName · ${fmtTime(audioDur)}")
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = { toggleAudition() }) { Text(if (auditioning) "■ Stop" else "▶ Listen") }
-                            OutlinedButton(onClick = { pickAudio.launch(arrayOf("audio/*")) }) { Text("Change") }
-                            TextButton(onClick = { stopAudition(); audioFile = null; audioName = ""; audioDur = 0.0 }) { Text("Remove") }
-                        }
-                        Text("Starts at 0:00. Leave Duration blank to make the video as long as the audio + 0.4 s.", style = MaterialTheme.typography.bodySmall)
                     }
                 }
 
