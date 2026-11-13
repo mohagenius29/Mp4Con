@@ -35,7 +35,7 @@ object RenderController {
             try {
                 val h = host.filterNotNull().first()
                 val uri = Engine.render(service.applicationContext, cfg, h)
-                RenderState.update { it.copy(phase = Phase.Done, outUri = uri, msg = "Saved to Movies/HTML2MP4", fraction = 1f, etaSec = 0) }
+                RenderState.update { it.copy(phase = Phase.Done, outUri = uri, msg = "Saved to Movies/HTML2MP4" + (RenderState.warning?.let { "\n⚠ $it" } ?: ""), fraction = 1f, etaSec = 0) }
                 service.finish("Video saved to Movies/HTML2MP4")
             } catch (e: CancellationException) {
                 RenderState.update { UiState(phase = Phase.Idle, msg = "Cancelled (finished parts are cached; press Start to resume).") }

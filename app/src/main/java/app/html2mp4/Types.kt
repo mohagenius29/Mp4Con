@@ -47,6 +47,8 @@ object RenderState {
     val ui: StateFlow<UiState> = _ui
     fun update(f: (UiState) -> UiState) = _ui.update(f)
     fun reset() { _ui.value = UiState() }
+    /** Non-fatal problem found while rendering (e.g. no sound captured); shown next to "Saved". */
+    @Volatile var warning: String? = null
 }
 
 class RenderError(message: String, cause: Throwable? = null) : Exception(message, cause)

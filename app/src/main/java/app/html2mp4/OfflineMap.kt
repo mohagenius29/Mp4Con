@@ -7,7 +7,11 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
 import java.util.Locale
 
 /** User-defined URL-prefix -> local file mappings (copied into app storage). One "url<TAB>filename" per line. */
@@ -32,6 +36,53 @@ object Mappings {
     }
 }
 
+/**
+ * Disk cache for everything the page downloads (fonts, CDN scripts, images, audio files). The first render needs internet;
+ * later renders of the same page work offline and are deterministic. Only static-looking files are cached, never API calls.
+ */
+class NetCache(ctx: Context) {
+    private val dir = File(ctx.filesDir, "netcache").apply { mkdirs() }
+    private fun key(url: String) = MessageDigest.getInstance("SHA-1").digest(url.toByteArray()).joinToString("") { "%02x".format(it) }
+    private fun bin(url: String) = File(dir, key(url) + ".bin")
+    private fun meta(url: String) = File(dir, key(url) + ".mime")
+
+    fun cached(url: String): File? = bin(url).takeIf { it.exists() && it.length() > 0 }
+    fun mime(url: String): String? = meta(url).takeIf { it.exists() }?.readText()?.takeIf { it.isNotBlank() }
+
+    fun cacheable(u: Uri): Boolean {
+        val host = u.host ?: return false
+        if (host == "fonts.googleapis.com" || host == "fonts.gstatic.com") return true
+        val ext = (u.path ?: "").substringAfterLast('.', "").lowercase(Locale.US)
+        return ext in setOf("js", "mjs", "css", "woff", "woff2", "ttf", "otf", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico",
+            "mp3", "wav", "ogg", "oga", "m4a", "aac", "flac", "opus", "weba", "mp4", "webm", "glb", "gltf", "bin", "wasm")
+    }
+
+    fun fetch(url: String, headers: Map<String, String>): File? {
+        cached(url)?.let { it.setLastModified(System.currentTimeMillis()); return it }
+        return try {
+            val c = URL(url).openConnection() as HttpURLConnection
+            c.connectTimeout = 10_000; c.readTimeout = 30_000; c.instanceFollowRedirects = true
+            headers["User-Agent"]?.let { c.setRequestProperty("User-Agent", it) }
+            c.setRequestProperty("Accept", headers["Accept"] ?: "*/*")
+            if (c.responseCode !in 200..299) { AppLog.d("net $url -> HTTP ${c.responseCode}"); return null }
+            val tmp = File(dir, key(url) + ".tmp")
+            c.inputStream.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
+            if (tmp.length() == 0L) { tmp.delete(); return null }
+            bin(url).delete(); tmp.renameTo(bin(url))
+            meta(url).writeText((c.contentType ?: "").substringBefore(';').trim())
+            AppLog.d("net downloaded $url (${bin(url).length() / 1024} KB)")
+            prune()
+            bin(url)
+        } catch (e: Exception) { AppLog.d("net failed $url: ${e.javaClass.simpleName} ${e.message}"); null }
+    }
+
+    private fun prune(maxBytes: Long = 300L * 1024 * 1024) {
+        val files = dir.listFiles { f -> f.name.endsWith(".bin") }?.sortedBy { it.lastModified() } ?: return
+        var total = files.sumOf { it.length() }
+        for (f in files) { if (total <= maxBytes) break; total -= f.length(); f.delete(); File(dir, f.name.removeSuffix(".bin") + ".mime").delete() }
+    }
+}
+
 /** Serves the HTML itself, bundled assets (three.js r128, Google Fonts) and custom mappings without network. */
 class OfflineMap(private val ctx: Context, private val indexFile: File) {
     companion object {
@@ -42,7 +93,10 @@ class OfflineMap(private val ctx: Context, private val indexFile: File) {
     }
 
     private val custom = Mappings.load(ctx)
+    private val net = NetCache(ctx)
     fun customFile(url: String): File? = custom.firstOrNull { url.startsWith(it.first) }?.second
+    /** File downloaded earlier for this URL (used to find the audio of <audio src="https://...">). */
+    fun cachedFile(url: String): File? = net.cached(url)
 
     fun intercept(req: WebResourceRequest): WebResourceResponse? {
         val u = req.url; val url = u.toString()
@@ -50,29 +104,44 @@ class OfflineMap(private val ctx: Context, private val indexFile: File) {
         customFile(url)?.let { AppLog.d("map custom $url"); return resp(mime(it.name), it.inputStream()) }
         val path = u.path ?: ""
         if (u.host == "html2mp4.local" && path.startsWith("/offline/")) return asset(path.removePrefix("/"))
-        if (u.host == "fonts.googleapis.com") return googleFontsCss(u)
+        if (u.host == "fonts.googleapis.com") return googleFontsCss(req)
         if (path.endsWith(".js") && path.contains("three") && (path.contains("r128") || path.contains("0.128"))) {
             AppLog.d("map three.js r128 <- $url"); return asset("offline/three.min.js")
+        }
+        // any other static file from the internet: download once, then serve from disk
+        if ((u.scheme == "http" || u.scheme == "https") && u.host != "html2mp4.local" && req.method == "GET" && net.cacheable(u)) {
+            net.fetch(url, req.requestHeaders)?.let { f -> return resp(net.mime(url) ?: mime(f.name), FileInputStream(f)) }
         }
         return null // fall through to the network if available
     }
 
-    private fun googleFontsCss(u: Uri): WebResourceResponse? {
+    private fun googleFontsCss(req: WebResourceRequest): WebResourceResponse? {
+        val u = req.url
         val families = u.getQueryParameters("family").flatMap { it.split('|') }
         val css = StringBuilder()
+        var missing = 0
         for (fam in families) {
             val name = fam.substringBefore(':').replace('+', ' ')
             val slug = name.lowercase(Locale.US).replace(' ', '-')
-            val files = ctx.assets.list("offline/fonts/$slug") ?: continue
+            val files = ctx.assets.list("offline/fonts/$slug")
+            if (files == null || files.isEmpty()) { missing++; continue }
             for (f in files) {
                 val m = Regex(".*-(latin|arabic)-(\\d+)-(normal|italic)\\.woff2").matchEntire(f) ?: continue
                 css.append("@font-face{font-family:'$name';font-style:${m.groupValues[3]};font-weight:${m.groupValues[2]};")
                     .append("src:url($ORIGIN/offline/fonts/$slug/$f) format('woff2');unicode-range:${if (m.groupValues[1] == "arabic") ARABIC else LATIN};}\n")
             }
         }
-        AppLog.d("map google fonts css ${u.query} -> ${if (css.isEmpty()) "no bundled family (add a custom mapping)" else "bundled"}")
-        if (css.isEmpty()) return null
-        return resp("text/css", ByteArrayInputStream(css.toString().toByteArray()))
+        if (css.isNotEmpty() && missing == 0) {
+            AppLog.d("fonts ${u.query} -> bundled")
+            return resp("text/css", ByteArrayInputStream(css.toString().toByteArray()))
+        }
+        // some family is not bundled: use the real Google Fonts CSS (cached for offline reuse), keep bundled files as last resort
+        net.fetch(u.toString(), req.requestHeaders)?.let { f ->
+            AppLog.d("fonts ${u.query} -> google (cached)")
+            return resp("text/css", FileInputStream(f))
+        }
+        AppLog.d("fonts ${u.query} -> " + if (css.isEmpty()) "NOT available (offline and not bundled; add a custom mapping or connect once)" else "partial bundled (offline)")
+        return if (css.isEmpty()) null else resp("text/css", ByteArrayInputStream(css.toString().toByteArray()))
     }
 
     private fun asset(p: String): WebResourceResponse? = try { resp(mime(p), ctx.assets.open(p)) } catch (e: Exception) { null }

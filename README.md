@@ -56,10 +56,18 @@ UI stays responsive because the main thread only schedules JS and waits for call
    Landscape/portrait is forced per orientation; phones whose screen is smaller than the output (e.g. 1080p on a 720-wide screen) get a clear error.
 2. **Frame settling.** `SETTLE_VSYNCS = 2` in `Engine.kt`. If you see duplicated/stale frames raise it to 3; if all is fine try 1 for speed.
 3. **Speed.** Expect roughly 8–20 rendered fps at 720p (each frame needs a paint + PixelCopy). A 60 s clip at 30 fps may take 2–5 minutes.
-4. **Not supported:** Web Audio API (`AudioContext`) sound, `<video>` elements, audio from non-embedded URLs (map them in the UI or embed as base64), `loop`ed audio (treated as ended), negative playback rates.
+4. **Not supported:** Web Audio API (`AudioContext`) sound (the app now warns "video has no sound" instead of failing silently), `<video>` elements, `loop`ed audio (treated as ended), negative playback rates.
+   Audio from `data:` URIs, `blob:` URLs the page builds at runtime, and downloaded `https://` files is picked up automatically.
 5. **Audio sync.** AAC priming adds ≈20 ms; atempo/rubberband add small edge effects at segment joins (segments are ≤6 frames).
 6. **Background.** If you leave the app, rendering pauses at the next frame (the window must be visible for PixelCopy) and continues when you return. The foreground service keeps the process alive.
 7. **Android WebView** must support document-start scripts (any reasonably current "Android System WebView").
 
 ## Settings you can change in code
 `RenderConfig` (tail, max duration, fallback duration), `Engine.SEG_SECONDS` (cache granularity), `SegmentEncoder` bitrate (0.15 bits/pixel/frame, 2–40 Mbps).
+
+## Robustness features (v2)
+- **Network cache:** fonts (Google Fonts CSS + files), CDN scripts, images and audio files the page downloads are cached in `files/netcache` (max 300 MB). The first render of a page needs internet; later renders work offline. Bundled fonts (Inter, Roboto, Poppins, Montserrat, Playfair Display, Amiri, Cinzel, Cormorant, Lora, Merriweather, Open Sans, Lato, Oswald, Raleway, Nunito, Cairo, Tajawal, Noto Naskh Arabic, Bebas Neue, Dancing Script, Pacifico) work offline from the start.
+- **Every declared `@font-face` is force-loaded** before frame 0, so canvas text uses the right font.
+- **Start buttons** are found by label in several languages (e.g. "Cheza wimbo"), and as a fallback the first non-pause button is clicked if nothing has played after a few frames. The page is opened with `#render` in the URL for pages that have a render mode.
+- **Audio** from `blob:` URLs is streamed to the app (`BlobSink`); audio duration falls back to the embedded file when the WebView cannot load the element.
+- **Audio problems never fail the render:** the MP4 is saved and a warning is shown (and written to `render.log`).

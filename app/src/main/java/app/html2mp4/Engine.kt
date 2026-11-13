@@ -2,6 +2,7 @@ package app.html2mp4
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
@@ -53,6 +54,7 @@ object Engine {
         val app = ctx.applicationContext
         val fps = cfg.fps
         AppLog.reset("HTML2MP4 on ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n$cfg")
+        RenderState.warning = null
         RenderState.update { UiState(phase = Phase.Preparing, msg = "Preparing…", renderW = cfg.width, renderH = cfg.height) }
 
         // ---- job cache (resume) ----
@@ -68,6 +70,8 @@ object Engine {
         try {
             val web = rig.webView
             val map = OfflineMap(app, cfg.htmlFile)
+            val blobs = BlobSink(jobDir)
+            web.addJavascriptInterface(blobs, "__h2m")
             val loaded = CompletableDeferred<Unit>()
             web.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest) = map.intercept(r)
@@ -88,7 +92,7 @@ object Engine {
                 throw RenderError("This phone's Android System WebView is too old (no document-start scripts). Update \"Android System WebView\" in the Play Store.")
             val clockJs = app.assets.open("virtual_clock.js").bufferedReader().readText().replace("__W__", cfg.width.toString())
             WebViewCompat.addDocumentStartJavaScript(web, clockJs, setOf("*"))
-            web.loadUrl(OfflineMap.INDEX)
+            web.loadUrl(OfflineMap.INDEX + "#render") // some pages look for "render" in the URL to auto-start
             withTimeout(60_000) { loaded.await() }
 
             // ---- wait for fonts + images, then pre-roll ----
@@ -102,6 +106,16 @@ object Engine {
             val info = JSONObject(web.eval("__vc.info()", rig))
             AppLog.d("page viewport ${info.getInt("w")}x${info.getInt("h")} (target ${cfg.width}x${cfg.height})")
             if (info.getInt("w") != cfg.width) AppLog.d("WARN page CSS viewport width differs from output width; layout may be scaled")
+            // durations of embedded audio, in case the WebView cannot load the element itself
+            val durJson = JSONObject()
+            withContext(Dispatchers.IO) {
+                for ((key, file) in audioFiles) try {
+                    val r = MediaMetadataRetriever(); r.setDataSource(file.absolutePath)
+                    val ms = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull(); r.release()
+                    if (ms != null && ms > 0) durJson.put(key, ms / 1000.0)
+                } catch (e: Exception) { AppLog.d("could not read duration of ${file.name}: ${e.message}") }
+            }
+            if (durJson.length() > 0) web.eval("Object.assign(__vc.durByKey, $durJson); 1", rig)
             web.eval("__vc.prepare(${cfg.autoClick},${cfg.hideOverlays})", rig)
             web.eval("__vc.step(0,-1)", rig); web.eval("__vc.step(0,-1)", rig)
             settle(web); settle(web)
@@ -208,6 +222,9 @@ object Engine {
             // ---- audio ----
             RenderState.update { it.copy(phase = Phase.Audio, msg = "Rendering audio…", fraction = -1f, etaSec = -1) }
             var audioOut: File? = null
+            var warn: String? = null
+            var unresolved = 0
+            fun byKey(k: String) = audioFiles.firstOrNull { k.startsWith(it.first) || it.first.startsWith(k) }?.second
             val meta = JSONArray(web.eval("__vc.audioMeta()", rig))
             if (meta.length() > 0) {
                 val logJson = JSONArray(web.eval("__vc.log", rig, 120_000))
@@ -219,18 +236,36 @@ object Engine {
                 val inputs = ArrayList<Pair<File, List<AudioSeg>>>()
                 for (i in 0 until meta.length()) {
                     val m = meta.getJSONObject(i); val src = m.getString("src")
-                    val file = if (src.startsWith("data:")) audioFiles.firstOrNull { src.startsWith(it.first) || it.first.startsWith(src) }?.second else map.customFile(src)
+                    var file: File? = when {
+                        src.startsWith("data:") -> byKey(src)
+                        src.startsWith("blob:") -> blobs.fileFor(src) ?: m.optString("key").takeIf { it.isNotEmpty() }?.let { byKey(it) }
+                        else -> map.customFile(src) ?: map.cachedFile(src)
+                    }
+                    if (file == null && audioFiles.size == 1) { file = audioFiles[0].second; AppLog.d("audio #$i: source not recognised, assuming the single embedded audio file") }
                     val plan = AudioPlanner.plan(perId[m.getInt("id")] ?: emptyList(), fps, totalFrames)
                     val audible = plan.any { !it.silence }
                     AppLog.d("audio #$i src=${src.take(40)} file=${file?.name} segments=${plan.size} audible=$audible")
-                    if (file == null && audible) AppLog.d("WARN audio #$i played but its source is not a data: URI or a mapped URL; it will be silent.")
+                    if (file == null && audible) { unresolved++; AppLog.d("WARN audio #$i played but its file could not be found; it will be silent.") }
                     if (file != null && audible) inputs += file to plan
                 }
                 if (inputs.isNotEmpty()) {
-                    audioOut = File(jobDir, "audio.m4a")
-                    withContext(Dispatchers.IO) { AudioRenderer.render(inputs, durationSec, audioOut) }
+                    val out = File(jobDir, "audio.m4a")
+                    try {
+                        withContext(Dispatchers.IO) { AudioRenderer.render(inputs, durationSec, out) }
+                        audioOut = out
+                    } catch (e: kotlinx.coroutines.CancellationException) { throw e
+                    } catch (e: Exception) {
+                        AppLog.d("audio render failed, saving the video without sound: ${e.message}")
+                        warn = "The audio could not be mixed (${e.message}), so the video has no sound. See log."
+                    }
                 }
             }
+            if (audioOut == null && warn == null) {
+                if (unresolved > 0) warn = "The page played audio but its file could not be found, so the video has no sound. See log."
+                else if (web.eval("__vc.webAudio", rig) == "true") warn = "This page makes sound with the Web Audio API, which cannot be captured, so the video has no sound."
+            }
+            RenderState.warning = warn
+            warn?.let { AppLog.d("WARNING: $it") }
 
             // ---- mux + save ----
             RenderState.update { it.copy(phase = Phase.Muxing, msg = "Writing MP4…") }

@@ -4,7 +4,7 @@
   var RD = Date;
   var vc = window.__vc = { t: 0, prev: 0, epoch: RD.now(), raf: [], rafId: 0, timers: [], timerId: 0,
     anims: new WeakMap(), synced: false, audios: [], log: [], errors: [], everPlayed: false,
-    isReady: false, cfg: null, clicked: new WeakSet() };
+    isReady: false, cfg: null, clicked: new WeakSet(), durByKey: {}, webAudio: false };
 
   // ---- fixed device pixel ratio + viewport so CSS px == output px
   try { Object.defineProperty(window, 'devicePixelRatio', { get: function () { return 1; }, configurable: true }); } catch (e) {}
@@ -45,9 +45,54 @@
   window.setInterval = function (fn, ms) { return addTimer(fn, ms, [].slice.call(arguments, 2), true); };
   window.clearTimeout = window.clearInterval = function (id) { vc.timers = vc.timers.filter(function (x) { return x.id !== id; }); };
 
-  // ---- stubbed media elements: the page's own currentTime / playbackRate logic runs against these
   var P = HTMLMediaElement.prototype, S = '__vs';
   var nativeDur = Object.getOwnPropertyDescriptor(P, 'duration').get;
+
+  // ---- blob: URLs made by the page (audio rebuilt from base64, fetched, generated...): keep a short key and stream the bytes to the app
+  vc.blobKeys = {};
+  try {
+    var origCOU = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = function (b) {
+      var u = origCOU(b);
+      try {
+        var ty = (b && b.type) || '';
+        if (b && b.size && b.size < 80e6 && (/^(audio|video)\//.test(ty) || ty === '' || ty === 'application/octet-stream')) {
+          var fr = new FileReader();
+          fr.onload = function () {
+            var res = String(fr.result);
+            vc.blobKeys[u] = res.slice(0, 60);
+            if (window.__h2m) {
+              var b64 = res.slice(res.indexOf(',') + 1), N = 400000, n = Math.max(1, Math.ceil(b64.length / N));
+              for (var q = 0; q < n; q++) window.__h2m.chunk(u, q, n, ty, b64.substr(q * N, N));
+            }
+          };
+          fr.readAsDataURL(b);
+        }
+      } catch (e) { vc.errors.push(String(e)); }
+      return u;
+    };
+  } catch (e) {}
+
+  // ---- Web Audio cannot be captured: flag it so the app can warn instead of silently producing a mute video
+  ['AudioContext', 'webkitAudioContext'].forEach(function (n) {
+    try {
+      var O = window[n]; if (!O) return;
+      var W = function () { vc.webAudio = true; return new (Function.prototype.bind.apply(O, [null].concat([].slice.call(arguments))))(); };
+      W.prototype = O.prototype; window[n] = W;
+    } catch (e) {}
+  });
+
+  // duration: native if the element loaded, else the app's probe of the embedded file
+  function durOf(el) {
+    var d = nativeDur.call(el);
+    if (isFinite(d) && d > 0) return d;
+    var s = el.currentSrc || el.src || '';
+    if (s.indexOf('blob:') === 0 && vc.blobKeys[s]) s = vc.blobKeys[s];
+    var k = s.indexOf('data:') === 0 ? s.slice(0, 60) : s;
+    return vc.durByKey[k] || d;
+  }
+
+  // ---- stubbed media elements: the page's own currentTime / playbackRate logic runs against these
   function st(el) {
     var s = el[S];
     if (!s) { s = el[S] = { pos: 0, rate: 1, playing: false, ended: false, played: false }; vc.audios.push(el); }
@@ -68,7 +113,7 @@
   P.pause = function () { var s = st(this); if (s.playing) { s.playing = false; this.dispatchEvent(new Event('pause')); } };
 
   // ---- overlay buttons
-  var startRe = /^\s*(▶|►|⏵|▷)?\s*(play|start|begin|tap to start|click to start)/i;
+  var startRe = /^\s*(▶|►|⏵|▷)?\s*(play|start|begin|tap to start|click to start|cheza|anza|washa|sikiliza|tazama|jouer|lancer|d[eé]marrer|lire|reproducir|iniciar|comenzar|spielen|starten|abspielen|riproduci|avvia|oynat|ba[sş]lat|putar|mulai|تشغيل|ابدأ|شغل|ابدا)/i;
   var hideRe = /(play|pause|replay|restart|▶|⏸|↻|⟳|↺)/i;
   function buttons() { return [].slice.call(document.querySelectorAll('button,[role=button],.btn,a.button,input[type=button]')); }
   function autoClick() {
@@ -79,6 +124,12 @@
         vc.clicked.add(b); try { b.click(); } catch (e) { vc.errors.push(String(e)); }
       }
     });
+  }
+  // Fallback for pages whose start button has another label (e.g. "Cheza wimbo"): if nothing has played yet, click the first non-pause-like button once.
+  function fallbackClick() {
+    if (vc.everPlayed || vc.fallbackDone) return;
+    var bs = buttons().filter(function (b) { var t = (b.textContent || b.value || '').trim(); return t.length < 40 && !/(pause|stop|replay|restart|mute|close|⏸|↻|⟳|↺)/i.test(t + ' ' + (b.id || '')); });
+    if (bs.length) { vc.fallbackDone = true; try { bs[0].click(); } catch (e) { vc.errors.push(String(e)); } }
   }
   function hideOverlays() {
     buttons().forEach(function (b) {
@@ -119,12 +170,19 @@
     var imgs = [].slice.call(document.images).map(function (i) {
       return i.complete ? 1 : new Promise(function (r) { i.addEventListener('load', r); i.addEventListener('error', r); });
     });
-    Promise.all([document.fonts ? document.fonts.ready : 1].concat(imgs)).then(function () { vc.isReady = true; });
+    var fnts = [];
+    try { if (document.fonts && document.fonts.forEach) document.fonts.forEach(function (f) { try { fnts.push(Promise.resolve(f.load()).catch(function () {})); } catch (e) {} }); } catch (e) {}
+    var auds = [].slice.call(document.querySelectorAll('audio')).map(function (a) {
+      if (a.readyState >= 1) return 1;
+      return new Promise(function (r) { a.addEventListener('loadedmetadata', r); a.addEventListener('error', r); setTimeout(r, 8000); });
+    });
+    Promise.all([document.fonts ? document.fonts.ready : 1].concat(imgs, auds, fnts)).then(function () { vc.isReady = true; });
     return 1;
   };
   vc.info = function () { return { w: innerWidth, h: innerHeight, dpr: 1, audios: vc.audios.length }; };
   vc.audioMeta = function () {
-    return vc.audios.map(function (el, i) { var s = el.currentSrc || el.src || ''; return { id: i, src: s.indexOf('data:') === 0 ? s.slice(0, 60) : s, dur: nativeDur.call(el) || 0 }; });
+    return vc.audios.map(function (el, i) { var s = el.currentSrc || el.src || '';
+      return { id: i, src: s.indexOf('data:') === 0 ? s.slice(0, 60) : s, key: vc.blobKeys[s] || '', dur: durOf(el) || 0 }; });
   };
 
   /* Advance to absolute virtual time t (ms) for frame index f. Returns a small state object. */
@@ -132,7 +190,7 @@
     var dt = Math.max(0, t - vc.t); vc.prev = vc.t; vc.t = t;
     var playing = 0, played = 0, ended = 0, prog = -1, events = [];
     for (var i = 0; i < vc.audios.length; i++) {
-      var el = vc.audios[i], s = el[S], dur = nativeDur.call(el), before = s.pos, was = s.playing;
+      var el = vc.audios[i], s = el[S], dur = durOf(el), before = s.pos, was = s.playing;
       if (was && dt > 0) {
         s.pos += dt / 1000 * s.rate;
         if (isFinite(dur) && s.pos >= dur) {
@@ -152,6 +210,7 @@
     for (var j = 0; j < q.length; j++) { try { q[j].cb(t); } catch (e) { vc.errors.push(String(e)); } }
     if (vc.cfg) {
       if (vc.cfg.click && f < 3) autoClick();
+      if (vc.cfg.click && f >= 3 && f <= 40 && f % 5 === 0) fallbackClick();
       if (vc.cfg.hide && (f < 3 || f % 15 === 0)) hideOverlays();
     }
     syncAnims();
