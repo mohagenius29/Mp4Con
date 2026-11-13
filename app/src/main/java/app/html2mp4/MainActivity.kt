@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.media.MediaMetadataRetriever
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -24,6 +25,7 @@ import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -72,6 +74,22 @@ class MainActivity : ComponentActivity(), RenderHost {
     private var audioName by mutableStateOf("")
     private var audioDur by mutableDoubleStateOf(0.0)
     private lateinit var preview: PreviewController
+    private var auditioner: MediaPlayer? = null
+    private var auditioning by mutableStateOf(false)
+
+    private fun stopAudition() { runCatching { auditioner?.release() }; auditioner = null; auditioning = false }
+    private fun toggleAudition() {
+        if (auditioning) { stopAudition(); return }
+        val f = audioFile ?: return
+        runCatching {
+            auditioner = MediaPlayer().apply {
+                setDataSource(f.absolutePath); prepare(); start()
+                setOnCompletionListener { stopAudition() }
+            }
+            auditioning = true
+        }.onFailure { stopAudition(); Toast.makeText(this, "Cannot play this audio file.", Toast.LENGTH_LONG).show() }
+    }
+    private fun clearFile() { stopAudition(); htmlFile = null; htmlName = ""; RenderState.reset() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -87,7 +105,7 @@ class MainActivity : ComponentActivity(), RenderHost {
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); handleIntent(intent) }
     override fun onResume() { super.onResume(); _resumed.value = true; preview.setAppResumed(true) }
     override fun onPause() { _resumed.value = false; preview.setAppResumed(false); super.onPause() }
-    override fun onDestroy() { if (RenderController.host.value === this) RenderController.host.value = null; preview.release(); super.onDestroy() }
+    override fun onDestroy() { if (RenderController.host.value === this) RenderController.host.value = null; preview.release(); stopAudition(); super.onDestroy() }
 
     @Deprecated("Deprecated in Java")
     override fun onTrimMemory(level: Int) {
@@ -230,6 +248,16 @@ class MainActivity : ComponentActivity(), RenderHost {
     private fun dims(res: Int, o: Int): Pair<Int, Int> = when (o) { 0 -> res to res * 16 / 9; 1 -> res * 16 / 9 to res; else -> res to res }
 
     @Composable
+    private fun Section(title: String, content: @Composable ColumnScope.() -> Unit) {
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(title, style = MaterialTheme.typography.titleMedium)
+                content()
+            }
+        }
+    }
+
+    @Composable
     private fun SetupScreen(ui: UiState) {
         var res by rememberSaveable { mutableIntStateOf(720) }
         var orient by rememberSaveable { mutableIntStateOf(0) }
@@ -240,11 +268,14 @@ class MainActivity : ComponentActivity(), RenderHost {
         var showMaps by rememberSaveable { mutableStateOf(false) }
         var turbo by rememberSaveable { mutableStateOf(true) }
 
-        val pickAudio = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) importAudio(u) }
+        BackHandler(enabled = htmlFile != null) { clearFile() }
+
+        val pickAudio = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) { stopAudition(); importAudio(u) } }
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) importUri(u) }
         val start = {
             val f = htmlFile
             if (f != null) {
+                stopAudition()
                 val (w, h) = dims(res, orient)
                 RenderController.start(this, RenderConfig(f, htmlName, w, h, fps, hide, click, dur.toDoubleOrNull() ?: 0.0, audioFile = audioFile, audioDurSec = audioDur, turbo = turbo))
             }
@@ -257,52 +288,87 @@ class MainActivity : ComponentActivity(), RenderHost {
                 else -> start()
             }
         }
+        val (w, h) = dims(res, orient)
 
-        Column(Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("HTML2MP4", style = MaterialTheme.typography.headlineMedium)
-            Text("Frame-accurate HTML → MP4, rendered on this phone.", style = MaterialTheme.typography.bodyMedium)
-            Button(onClick = { pick.launch(arrayOf("text/html", "text/plain", "application/xhtml+xml")) }) { Text(if (htmlFile == null) "Pick .html file" else "File: $htmlName (change)") }
-
-            OutlinedButton(onClick = { useSample() }) { Text("Use built-in 5 s test sample") }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Button(onClick = { pickAudio.launch(arrayOf("audio/*")) }) { Text(if (audioFile == null) "Upload audio" else "Audio: $audioName") }
-                if (audioFile != null) TextButton(onClick = { audioFile = null; audioName = ""; audioDur = 0.0 }) { Text("Remove") }
+        Column(Modifier.fillMaxSize().systemBarsPadding()) {
+            // ---- header with Back ----
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (htmlFile != null) TextButton(onClick = { clearFile() }) { Text("← Back") } else Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("HTML2MP4", style = MaterialTheme.typography.titleLarge)
+                    Text(if (htmlFile == null) "Turn an HTML animation into an MP4" else htmlName, style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                }
             }
-            if (audioFile != null) Text("Soundtrack ${fmtTime(audioDur)} is mixed in from 0:00 (with any sound the page makes). Blank duration = soundtrack length + 0.4 s.", style = MaterialTheme.typography.bodySmall)
 
-            Text("Resolution"); Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(720, 1080).forEach { FilterChip(res == it, { res = it }, { Text("${it}p") }) } }
-            Text("Orientation"); Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("9:16", "16:9", "1:1").forEachIndexed { i, s -> FilterChip(orient == i, { orient = i }, { Text(s) }) } }
-            Text("FPS"); Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(24, 30, 60).forEach { FilterChip(fps == it, { fps = it }, { Text("$it") }) } }
-            val (w, h) = dims(res, orient); Text("Output: ${w}×${h} @ $fps fps", style = MaterialTheme.typography.bodySmall)
-
-            Row(verticalAlignment = Alignment.CenterVertically) { Switch(hide, { hide = it }); Spacer(Modifier.width(8.dp)); Text("Hide Play / Pause / Replay buttons") }
-            Row(verticalAlignment = Alignment.CenterVertically) { Switch(click, { click = it }); Spacer(Modifier.width(8.dp)); Text("Auto-click Play / Start") }
-            Row(verticalAlignment = Alignment.CenterVertically) { Switch(turbo, { turbo = it }); Spacer(Modifier.width(8.dp)); Text("Turbo (faster; turn off if frames ever repeat)") }
-            OutlinedTextField(dur, { dur = it.filter { c -> c.isDigit() || c == '.' } }, label = { Text("Duration in seconds (blank = stop when audio ends + 0.4 s)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-
-            Button(onClick = { askAndStart() }, enabled = htmlFile != null, modifier = Modifier.fillMaxWidth()) { Text("Start") }
-
-            when (ui.phase) {
-                Phase.Done -> {
-                    Text("✔ ${ui.msg}")
-                    PreviewPanel(ui, maxW = 360.dp, maxH = 420.dp)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { ui.outUri?.let { u -> startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(u, "video/mp4").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)) } }) { Text("Open in gallery") }
-                        OutlinedButton(onClick = { shareLog() }) { Text("Share log") }
+            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (htmlFile == null) {
+                    Section("1 · Choose your animation") {
+                        Button(onClick = { pick.launch(arrayOf("text/html", "text/plain", "application/xhtml+xml")) }, modifier = Modifier.fillMaxWidth()) { Text("Pick .html file") }
+                        OutlinedButton(onClick = { useSample() }, modifier = Modifier.fillMaxWidth()) { Text("Use built-in 5 s test sample") }
+                    }
+                } else {
+                    Section("Animation") {
+                        Text(htmlName)
+                        OutlinedButton(onClick = { pick.launch(arrayOf("text/html", "text/plain", "application/xhtml+xml")) }) { Text("Change file") }
                     }
                 }
-                Phase.Error -> {
-                    Text("✖ ${ui.error}", color = MaterialTheme.colorScheme.error)
-                    Text("Finished parts are cached. Press Start to resume.", style = MaterialTheme.typography.bodySmall)
-                    OutlinedButton(onClick = { shareLog() }) { Text("Share log") }
+
+                Section("Soundtrack (optional)") {
+                    if (audioFile == null) {
+                        Text("Upload an mp3 / wav / m4a. It is mixed into the video and plays in the live preview.", style = MaterialTheme.typography.bodySmall)
+                        Button(onClick = { pickAudio.launch(arrayOf("audio/*")) }) { Text("Upload audio") }
+                    } else {
+                        Text("$audioName · ${fmtTime(audioDur)}")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { toggleAudition() }) { Text(if (auditioning) "■ Stop" else "▶ Listen") }
+                            OutlinedButton(onClick = { pickAudio.launch(arrayOf("audio/*")) }) { Text("Change") }
+                            TextButton(onClick = { stopAudition(); audioFile = null; audioName = ""; audioDur = 0.0 }) { Text("Remove") }
+                        }
+                        Text("Starts at 0:00. Leave Duration blank to make the video as long as the audio + 0.4 s.", style = MaterialTheme.typography.bodySmall)
+                    }
                 }
-                else -> if (ui.msg.isNotEmpty()) Text(ui.msg, style = MaterialTheme.typography.bodySmall)
+
+                Section("Video") {
+                    Text("Resolution"); Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(720, 1080).forEach { FilterChip(res == it, { res = it }, { Text("${it}p") }) } }
+                    Text("Shape"); Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("9:16", "16:9", "1:1").forEachIndexed { i, t -> FilterChip(orient == i, { orient = i }, { Text(t) }) } }
+                    Text("Frames per second"); Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(24, 30, 60).forEach { FilterChip(fps == it, { fps = it }, { Text("$it") }) } }
+                    Text("Output: ${w}×${h} @ $fps fps", style = MaterialTheme.typography.bodySmall)
+                }
+
+                Section("Options") {
+                    Row(verticalAlignment = Alignment.CenterVertically) { Switch(turbo, { turbo = it }); Spacer(Modifier.width(8.dp)); Text("Turbo (faster; turn off if frames repeat)") }
+                    Row(verticalAlignment = Alignment.CenterVertically) { Switch(hide, { hide = it }); Spacer(Modifier.width(8.dp)); Text("Hide Play / Pause / Replay buttons") }
+                    Row(verticalAlignment = Alignment.CenterVertically) { Switch(click, { click = it }); Spacer(Modifier.width(8.dp)); Text("Auto-click Play / Start") }
+                    OutlinedTextField(dur, { dur = it.filter { c -> c.isDigit() || c == '.' } }, label = { Text("Duration in seconds (blank = automatic)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                }
+
+                when (ui.phase) {
+                    Phase.Done -> Section("Finished") {
+                        Text("✔ ${ui.msg}")
+                        PreviewPanel(ui, maxW = 330.dp, maxH = 420.dp)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { ui.outUri?.let { u -> startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(u, "video/mp4").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)) } }) { Text("Open in gallery") }
+                            OutlinedButton(onClick = { shareLog() }) { Text("Share log") }
+                        }
+                        OutlinedButton(onClick = { clearFile() }, modifier = Modifier.fillMaxWidth()) { Text("← Back to file selection") }
+                    }
+                    Phase.Error -> Section("Something went wrong") {
+                        Text("✖ ${ui.error}", color = MaterialTheme.colorScheme.error)
+                        Text("Finished parts are cached. Press Start to resume.", style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(onClick = { shareLog() }) { Text("Share log") }
+                    }
+                    else -> if (ui.msg.isNotEmpty()) Text(ui.msg, style = MaterialTheme.typography.bodySmall)
+                }
+
+                TextButton(onClick = { showMaps = !showMaps }) { Text(if (showMaps) "Hide offline URL mappings" else "Offline URL mappings (CDN scripts / fonts)") }
+                if (showMaps) MappingsEditor()
+                Spacer(Modifier.height(8.dp))
             }
 
-            TextButton(onClick = { showMaps = !showMaps }) { Text(if (showMaps) "Hide offline URL mappings" else "Offline URL mappings (CDN scripts / fonts)") }
-            if (showMaps) MappingsEditor()
-            Text("Built in: three.js r128 and Google Fonts Inter, Roboto, Poppins, Montserrat, Playfair Display, Amiri.", style = MaterialTheme.typography.bodySmall)
+            // ---- sticky Start ----
+            Button(onClick = { askAndStart() }, enabled = htmlFile != null, modifier = Modifier.fillMaxWidth().padding(16.dp).height(52.dp)) {
+                Text(if (htmlFile == null) "Pick a file to start" else "Start rendering")
+            }
         }
     }
 
@@ -336,7 +402,9 @@ class MainActivity : ComponentActivity(), RenderHost {
             val boxW = maxWidth; val boxH = maxHeight
             val right = boxW - rw; val bottom = boxH - rh
             val mod = if (right >= bottom) Modifier.align(Alignment.TopEnd).width(right).fillMaxHeight() else Modifier.align(Alignment.BottomStart).fillMaxWidth().height(bottom)
+            BackHandler { RenderController.cancel() }
             Column(mod.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(onClick = { RenderController.cancel() }) { Text("← Back (stop rendering)") }
                 val frac = ui.fraction
                 if (frac >= 0) LinearProgressIndicator(progress = { frac }, Modifier.fillMaxWidth()) else LinearProgressIndicator(Modifier.fillMaxWidth())
                 Text(ui.msg, style = MaterialTheme.typography.bodyMedium)
@@ -347,7 +415,6 @@ class MainActivity : ComponentActivity(), RenderHost {
                 val availW = (if (right >= bottom) right else boxW) - 24.dp
                 val availH = (if (right >= bottom) boxH - 190.dp else bottom - 150.dp).coerceAtLeast(60.dp)
                 PreviewPanel(ui, maxW = availW.coerceAtLeast(60.dp), maxH = availH)
-                OutlinedButton(onClick = { RenderController.cancel() }) { Text("Cancel") }
             }
         }
     }

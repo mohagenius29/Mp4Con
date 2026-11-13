@@ -26,12 +26,16 @@ import java.io.File
 object PreviewFeed {
     class Chunk(val file: File, val durationSec: Double)
 
+    /** Uploaded soundtrack of the current render; the preview plays it in sync with the video. */
+    @Volatile var extAudio: File? = null
+
     private val _chunks = MutableStateFlow<List<Chunk>>(emptyList())
     val chunks: StateFlow<List<Chunk>> = _chunks
 
     fun dir(ctx: Context): File = File(ctx.cacheDir, "preview").apply { mkdirs() }
 
-    fun reset(ctx: Context): File {
+    fun reset(ctx: Context, ext: File? = null): File {
+        extAudio = ext
         _chunks.value = emptyList()
         dir(ctx).listFiles()?.forEach { it.delete() }
         return dir(ctx)
@@ -58,6 +62,8 @@ class PreviewController(ctx: Context) {
     }
 
     private val player: ExoPlayer = ExoPlayer.Builder(ctx).build()
+    private val ext: ExoPlayer = ExoPlayer.Builder(ctx).build()
+    private var extLoaded: File? = null
     private val handler = Handler(Looper.getMainLooper())
     private val planned = ArrayList<Double>()
     private val win = Timeline.Window()
@@ -87,9 +93,25 @@ class PreviewController(ctx: Context) {
     fun setSurface(sv: SurfaceView) { player.setVideoSurfaceView(sv) }
     fun clearSurface(sv: SurfaceView) { player.clearVideoSurfaceView(sv) }
 
-    fun setAppResumed(r: Boolean) { appResumed = r; if (!r) player.playWhenReady = false }
+    fun setAppResumed(r: Boolean) { appResumed = r; if (!r) { player.playWhenReady = false; ext.playWhenReady = false } }
 
-    fun release() { handler.removeCallbacksAndMessages(null); player.release() }
+    /** Keeps the uploaded soundtrack playing exactly while (and where) the preview video plays. */
+    private fun syncExt() {
+        val want = if (finalMode) null else PreviewFeed.extAudio
+        if (want != extLoaded) {
+            extLoaded = want
+            if (want == null) { ext.stop(); ext.clearMediaItems() }
+            else { ext.setMediaItem(MediaItem.fromUri(Uri.fromFile(want))); ext.prepare(); ext.playWhenReady = false }
+        }
+        if (want == null) return
+        if (player.isPlaying && appResumed) {
+            val target = (globalPos() * 1000).toLong()
+            if (kotlin.math.abs(ext.currentPosition - target) > 250) ext.seekTo(target)
+            ext.playWhenReady = true
+        } else ext.playWhenReady = false
+    }
+
+    fun release() { handler.removeCallbacksAndMessages(null); player.release(); ext.release() }
 
     // ---------- session control ----------
     fun resetSession() {
@@ -155,6 +177,7 @@ class PreviewController(ctx: Context) {
 
     private fun update() {
         playing = player.isPlaying
+        syncExt()
         if (finalMode) {
             posSec = globalPos()
             bufferedSec = if (player.duration != C.TIME_UNSET) player.duration / 1000.0 else bufferedSec

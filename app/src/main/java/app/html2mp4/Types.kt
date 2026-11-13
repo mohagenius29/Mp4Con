@@ -56,6 +56,8 @@ object RenderState {
     fun reset() { _ui.value = UiState() }
     /** Non-fatal problem found while rendering (e.g. no sound captured); shown next to "Saved". */
     @Volatile var warning: String? = null
+    /** Whether the finished MP4 contains an audio track. */
+    @Volatile var hasSound: Boolean = false
 }
 
 class RenderError(message: String, cause: Throwable? = null) : Exception(message, cause)

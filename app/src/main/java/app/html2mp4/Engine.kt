@@ -70,7 +70,7 @@ object Engine {
         File(jobDir, "seg_000.part").delete()
         val audioFiles = withContext(Dispatchers.IO) { extractAudio(cfg.htmlFile, jobDir) }
         AppLog.d("extracted ${audioFiles.size} embedded audio file(s)" + (cfg.audioFile?.let { "; uploaded soundtrack ${it.name} (${"%.1f".format(cfg.audioDurSec)} s)" } ?: ""))
-        val previewDir = PreviewFeed.reset(app)
+        val previewDir = PreviewFeed.reset(app, cfg.audioFile)
         val previewExec = Executors.newSingleThreadExecutor()
 
         val rig = host.openRig(cfg.width, cfg.height)
@@ -204,10 +204,7 @@ object Engine {
                     }
                 } catch (e: CancellationException) { throw e
                 } catch (e: Exception) { AppLog.d("preview: could not read page audio state: ${e.message}") }
-                cfg.audioFile?.let { ext ->
-                    val s0 = p.start.toDouble() / fps
-                    if (s0 < cfg.audioDurSec) inputs += ext to listOf(AudioSeg(false, s0, p.end.toDouble() / fps, dur))
-                }
+                // (the uploaded soundtrack is played by its own synced player in the preview, not through these chunks)
                 val idx = chunkNo++
                 previewExec.execute {
                     try {
@@ -363,6 +360,13 @@ object Engine {
             val finalFile = File(jobDir, "final.mp4")
             withContext(Dispatchers.IO) { Mux.run(segs, fps, audioOut, totalFrames * 1_000_000L / fps, finalFile) }
             val name = cfg.displayName.substringBeforeLast('.').replace(Regex("[^A-Za-z0-9_-]"), "_") + "_${cfg.width}x${cfg.height}_${System.currentTimeMillis() / 1000}.mp4"
+            val hasSound = withContext(Dispatchers.IO) {
+                runCatching { val r = MediaMetadataRetriever(); try { r.setDataSource(finalFile.absolutePath); r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes" } finally { r.release() } }.getOrDefault(false)
+            }
+            RenderState.hasSound = hasSound
+            AppLog.d("final file has audio track: $hasSound")
+            if (cfg.audioFile != null && !hasSound && RenderState.warning == null)
+                RenderState.warning = "Your uploaded audio did not end up in the video. Tap Share log and send it to me."
             val uri = withContext(Dispatchers.IO) { Saver.save(app, finalFile, name) }
             withContext(Dispatchers.IO) { previewExec.shutdown(); previewExec.awaitTermination(30, TimeUnit.SECONDS) }
             jobDir.deleteRecursively()
