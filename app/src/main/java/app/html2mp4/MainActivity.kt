@@ -333,7 +333,8 @@ class MainActivity : ComponentActivity(), RenderHost {
             // The WebView window covers the top-left corner at exact output size; controls use the remaining room.
             val rw = with(LocalDensity.current) { ui.renderW.toDp() }
             val rh = with(LocalDensity.current) { ui.renderH.toDp() }
-            val right = maxWidth - rw; val bottom = maxHeight - rh
+            val boxW = maxWidth; val boxH = maxHeight
+            val right = boxW - rw; val bottom = boxH - rh
             val mod = if (right >= bottom) Modifier.align(Alignment.TopEnd).width(right).fillMaxHeight() else Modifier.align(Alignment.BottomStart).fillMaxWidth().height(bottom)
             Column(mod.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 val frac = ui.fraction
@@ -343,8 +344,8 @@ class MainActivity : ComponentActivity(), RenderHost {
                     Text("Frame ${ui.frame}" + (if (ui.fraction >= 0) " · ${(ui.fraction * 100).toInt()}%" else "") +
                         (if (ui.renderFps > 0) " · %.1f fps".format(ui.renderFps) else "") + (if (ui.etaSec >= 0) " · ETA ${ui.etaSec / 60}m ${ui.etaSec % 60}s" else ""), style = MaterialTheme.typography.bodySmall)
                 }
-                val availW = (if (right >= bottom) right else maxWidth) - 24.dp
-                val availH = (if (right >= bottom) maxHeight - 190.dp else bottom - 150.dp).coerceAtLeast(60.dp)
+                val availW = (if (right >= bottom) right else boxW) - 24.dp
+                val availH = (if (right >= bottom) boxH - 190.dp else bottom - 150.dp).coerceAtLeast(60.dp)
                 PreviewPanel(ui, maxW = availW.coerceAtLeast(60.dp), maxH = availH)
                 OutlinedButton(onClick = { RenderController.cancel() }) { Text("Cancel") }
             }
