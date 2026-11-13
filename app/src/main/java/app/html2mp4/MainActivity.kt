@@ -8,24 +8,28 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.util.DisplayMetrics
 import android.view.Gravity
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
 import android.webkit.WebView
 import android.widget.FrameLayout
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -34,9 +38,13 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.content.IntentCompat
@@ -60,20 +68,26 @@ class MainActivity : ComponentActivity(), RenderHost {
     private var htmlFile by mutableStateOf<File?>(null)
     private var htmlName by mutableStateOf("")
     private var rig: Rig? = null
+    private var audioFile by mutableStateOf<File?>(null)
+    private var audioName by mutableStateOf("")
+    private var audioDur by mutableDoubleStateOf(0.0)
+    private lateinit var preview: PreviewController
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         AppLog.init(this)
+        preview = PreviewController(this)
+        lifecycleScope.launch { PreviewFeed.chunks.collect { preview.sync(it) } }
         RenderController.host.value = this
         handleIntent(intent)
         setContent { MaterialTheme(colorScheme = darkColorScheme()) { Surface(Modifier.fillMaxSize()) { App() } } }
     }
 
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); handleIntent(intent) }
-    override fun onResume() { super.onResume(); _resumed.value = true }
-    override fun onPause() { _resumed.value = false; super.onPause() }
-    override fun onDestroy() { if (RenderController.host.value === this) RenderController.host.value = null; super.onDestroy() }
+    override fun onResume() { super.onResume(); _resumed.value = true; preview.setAppResumed(true) }
+    override fun onPause() { _resumed.value = false; preview.setAppResumed(false); super.onPause() }
+    override fun onDestroy() { if (RenderController.host.value === this) RenderController.host.value = null; preview.release(); super.onDestroy() }
 
     @Deprecated("Deprecated in Java")
     override fun onTrimMemory(level: Int) {
@@ -91,11 +105,32 @@ class MainActivity : ComponentActivity(), RenderHost {
         if (uri != null) importUri(uri)
     }
 
+    private fun displayName(uri: Uri): String? = contentResolver.query(uri, null, null, null, null)?.use { c ->
+        if (c.moveToFirst()) c.getColumnIndex(OpenableColumns.DISPLAY_NAME).let { if (it >= 0) c.getString(it) else null } else null
+    }
+
+    /** Copies an uploaded soundtrack into app storage and reads its duration. */
+    private fun importAudio(uri: Uri) = lifecycleScope.launch {
+        val res = withContext(Dispatchers.IO) {
+            runCatching {
+                val name = displayName(uri) ?: "soundtrack"
+                val dir = File(filesDir, "audio_in").apply { mkdirs(); listFiles()?.forEach { it.delete() } }
+                val dst = File(dir, name.replace(Regex("[^A-Za-z0-9._-]"), "_"))
+                contentResolver.openInputStream(uri)!!.use { i -> dst.outputStream().use { o -> i.copyTo(o) } }
+                val mmr = MediaMetadataRetriever()
+                val ms = try { mmr.setDataSource(dst.absolutePath); mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull() } finally { mmr.release() }
+                Triple(name, dst, (ms ?: 0.0) / 1000.0)
+            }.getOrNull()
+        }
+        if (res == null || res.third <= 0.0) {
+            Toast.makeText(this@MainActivity, "Could not read that audio file.", Toast.LENGTH_LONG).show(); return@launch
+        }
+        audioName = res.first; audioFile = res.second; audioDur = res.third
+    }
+
     private fun importUri(uri: Uri) = lifecycleScope.launch {
         val f = withContext(Dispatchers.IO) {
-            val name = contentResolver.query(uri, null, null, null, null)?.use { c ->
-                if (c.moveToFirst()) c.getColumnIndex(OpenableColumns.DISPLAY_NAME).let { if (it >= 0) c.getString(it) else null } else null
-            } ?: "animation.html"
+            val name = displayName(uri) ?: "animation.html"
             val dir = File(filesDir, "inputs").apply { mkdirs(); listFiles()?.forEach { it.delete() } }
             val dst = File(dir, name.replace(Regex("[^A-Za-z0-9._-]"), "_"))
             contentResolver.openInputStream(uri)!!.use { i -> dst.outputStream().use { o -> i.copyTo(o) } }
@@ -154,7 +189,9 @@ class MainActivity : ComponentActivity(), RenderHost {
         w.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
-        w.attributes = w.attributes.also { it.x = 0; it.y = 0 }
+        // highest refresh rate the display offers: shorter vsyncs = faster capture loop
+        val maxHz = runCatching { @Suppress("DEPRECATION") windowManager.defaultDisplay.supportedModes.maxOf { it.refreshRate } }.getOrDefault(0f)
+        w.attributes = w.attributes.also { it.x = 0; it.y = 0; if (maxHz > 0f) it.preferredRefreshRate = maxHz }
         dlg.show()
         suspendCancellableCoroutine<Unit> { c -> web.post { c.resume(Unit) } }
         delay(150)
@@ -180,6 +217,13 @@ class MainActivity : ComponentActivity(), RenderHost {
     private fun App() {
         val ui by RenderState.ui.collectAsStateWithLifecycle()
         val busy = ui.phase == Phase.Preparing || ui.phase == Phase.Rendering || ui.phase == Phase.Audio || ui.phase == Phase.Muxing
+        LaunchedEffect(ui.phase, ui.outUri) {
+            when (ui.phase) {
+                Phase.Done -> ui.outUri?.let { preview.showFinal(it, if (ui.fps > 0) ui.frame.toDouble() / ui.fps else 0.0) }
+                Phase.Idle, Phase.Error -> preview.resetSession()
+                else -> {}
+            }
+        }
         if (busy) RenderingScreen(ui) else SetupScreen(ui)
     }
 
@@ -194,13 +238,15 @@ class MainActivity : ComponentActivity(), RenderHost {
         var click by rememberSaveable { mutableStateOf(true) }
         var dur by rememberSaveable { mutableStateOf("") }
         var showMaps by rememberSaveable { mutableStateOf(false) }
+        var turbo by rememberSaveable { mutableStateOf(true) }
 
+        val pickAudio = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) importAudio(u) }
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) importUri(u) }
         val start = {
             val f = htmlFile
             if (f != null) {
                 val (w, h) = dims(res, orient)
-                RenderController.start(this, RenderConfig(f, htmlName, w, h, fps, hide, click, dur.toDoubleOrNull() ?: 0.0))
+                RenderController.start(this, RenderConfig(f, htmlName, w, h, fps, hide, click, dur.toDoubleOrNull() ?: 0.0, audioFile = audioFile, audioDurSec = audioDur, turbo = turbo))
             }
         }
         val perm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { start() }
@@ -219,6 +265,12 @@ class MainActivity : ComponentActivity(), RenderHost {
 
             OutlinedButton(onClick = { useSample() }) { Text("Use built-in 5 s test sample") }
 
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = { pickAudio.launch(arrayOf("audio/*")) }) { Text(if (audioFile == null) "Upload audio" else "Audio: $audioName") }
+                if (audioFile != null) TextButton(onClick = { audioFile = null; audioName = ""; audioDur = 0.0 }) { Text("Remove") }
+            }
+            if (audioFile != null) Text("Soundtrack ${fmtTime(audioDur)} is mixed in from 0:00 (with any sound the page makes). Blank duration = soundtrack length + 0.4 s.", style = MaterialTheme.typography.bodySmall)
+
             Text("Resolution"); Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(720, 1080).forEach { FilterChip(res == it, { res = it }, { Text("${it}p") }) } }
             Text("Orientation"); Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("9:16", "16:9", "1:1").forEachIndexed { i, s -> FilterChip(orient == i, { orient = i }, { Text(s) }) } }
             Text("FPS"); Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf(24, 30, 60).forEach { FilterChip(fps == it, { fps = it }, { Text("$it") }) } }
@@ -226,6 +278,7 @@ class MainActivity : ComponentActivity(), RenderHost {
 
             Row(verticalAlignment = Alignment.CenterVertically) { Switch(hide, { hide = it }); Spacer(Modifier.width(8.dp)); Text("Hide Play / Pause / Replay buttons") }
             Row(verticalAlignment = Alignment.CenterVertically) { Switch(click, { click = it }); Spacer(Modifier.width(8.dp)); Text("Auto-click Play / Start") }
+            Row(verticalAlignment = Alignment.CenterVertically) { Switch(turbo, { turbo = it }); Spacer(Modifier.width(8.dp)); Text("Turbo (faster; turn off if frames ever repeat)") }
             OutlinedTextField(dur, { dur = it.filter { c -> c.isDigit() || c == '.' } }, label = { Text("Duration in seconds (blank = stop when audio ends + 0.4 s)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
 
             Button(onClick = { askAndStart() }, enabled = htmlFile != null, modifier = Modifier.fillMaxWidth()) { Text("Start") }
@@ -233,6 +286,7 @@ class MainActivity : ComponentActivity(), RenderHost {
             when (ui.phase) {
                 Phase.Done -> {
                     Text("✔ ${ui.msg}")
+                    PreviewPanel(ui, maxW = 360.dp, maxH = 420.dp)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(onClick = { ui.outUri?.let { u -> startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(u, "video/mp4").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)) } }) { Text("Open in gallery") }
                         OutlinedButton(onClick = { shareLog() }) { Text("Share log") }
@@ -289,11 +343,34 @@ class MainActivity : ComponentActivity(), RenderHost {
                     Text("Frame ${ui.frame}" + (if (ui.fraction >= 0) " · ${(ui.fraction * 100).toInt()}%" else "") +
                         (if (ui.renderFps > 0) " · %.1f fps".format(ui.renderFps) else "") + (if (ui.etaSec >= 0) " · ETA ${ui.etaSec / 60}m ${ui.etaSec % 60}s" else ""), style = MaterialTheme.typography.bodySmall)
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    ui.preview?.let { Image(it.asImageBitmap(), "Live preview", Modifier.height(if (right >= bottom) 120.dp else (bottom - 90.dp).coerceIn(48.dp, 160.dp))) }
-                    OutlinedButton(onClick = { RenderController.cancel() }) { Text("Cancel") }
-                }
+                val availW = (if (right >= bottom) right else maxWidth) - 24.dp
+                val availH = (if (right >= bottom) maxHeight - 190.dp else bottom - 150.dp).coerceAtLeast(60.dp)
+                PreviewPanel(ui, maxW = availW.coerceAtLeast(60.dp), maxH = availH)
+                OutlinedButton(onClick = { RenderController.cancel() }) { Text("Cancel") }
             }
+        }
+    }
+
+    private fun fmtTime(sec: Double): String { val t = sec.toInt().coerceAtLeast(0); return "%d:%02d".format(t / 60, t % 60) }
+
+    /** In-app player: plays finished chunks while the render runs, then the final MP4. Shows the live thumbnail until playback starts. */
+    @Composable
+    private fun PreviewPanel(ui: UiState, maxW: Dp, maxH: Dp) {
+        val ar = if (ui.renderW > 0 && ui.renderH > 0) ui.renderW.toFloat() / ui.renderH else 16f / 9f
+        val w = minOf(maxW, maxH * ar); val h = w / ar
+        val sv = remember { SurfaceView(this@MainActivity) }
+        DisposableEffect(sv) { preview.setSurface(sv); onDispose { preview.clearSurface(sv) } }
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Box(Modifier.size(w, h).background(ComposeColor.Black)) {
+                AndroidView(factory = { sv }, modifier = Modifier.fillMaxSize())
+                if (!preview.live) ui.preview?.let { Image(it.asImageBitmap(), "Live frame", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
+            }
+            if (preview.bufferedSec > 0.0) LinearProgressIndicator(progress = { (preview.posSec / preview.bufferedSec).toFloat().coerceIn(0f, 1f) }, Modifier.width(w))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(onClick = { preview.togglePlay() }, enabled = preview.live) { Text(if (preview.playing) "Pause" else "Play") }
+                Text("${fmtTime(preview.posSec)} / ${fmtTime(preview.bufferedSec)}", style = MaterialTheme.typography.bodySmall)
+            }
+            if (preview.status.isNotEmpty()) Text(preview.status, style = MaterialTheme.typography.bodySmall, modifier = Modifier.widthIn(max = maxOf(w, 220.dp)))
         }
     }
 

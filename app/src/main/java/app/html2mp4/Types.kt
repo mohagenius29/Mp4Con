@@ -24,6 +24,11 @@ data class RenderConfig(
     val maxDurationSec: Double = 600.0,
     /** Used when there is no audio and no manual duration. */
     val fallbackDurationSec: Double = 10.0,
+    /** Optional uploaded soundtrack (mp3/wav/m4a/...), mixed into the video from t=0. */
+    val audioFile: File? = null,
+    val audioDurSec: Double = 0.0,
+    /** Turbo: wait 1 vsync instead of 2 before each capture (faster; set false if you ever see repeated frames). */
+    val turbo: Boolean = true,
 )
 
 enum class Phase { Idle, Preparing, Rendering, Audio, Muxing, Done, Error }
@@ -40,6 +45,8 @@ data class UiState(
     val error: String? = null,
     val renderW: Int = 0,
     val renderH: Int = 0,
+    val fps: Int = 0,
+    val totalFrames: Int = -1,
 )
 
 object RenderState {

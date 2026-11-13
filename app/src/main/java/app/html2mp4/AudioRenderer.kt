@@ -9,12 +9,13 @@ import java.util.Locale
 object AudioRenderer {
     private fun f(d: Double) = String.format(Locale.US, "%.6f", d)
 
-    fun hasRubberband(): Boolean {
+    private val rubberCache: Boolean by lazy {
         val s = FFmpegKit.execute("-hide_banner -h filter=rubberband")
         val has = !(s.output ?: "").contains("Unknown filter", true)
         AppLog.d("ffmpeg rubberband filter available: $has")
-        return has
+        has
     }
+    fun hasRubberband(): Boolean = rubberCache
 
     private fun tempo(rate: Double, rubber: Boolean): String {
         if (abs1(rate)) return "anull"

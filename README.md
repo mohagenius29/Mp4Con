@@ -7,6 +7,11 @@ Never screen-records: time is virtual, so a slow phone gives the same video as a
 > tested off-device (Node / JUnit). Everything touching WebView, PixelCopy, MediaCodec and ffmpeg needs a first run on your phone.
 > Expect to read `render.log` (Share log button) and tune once. Section "Known risks" lists the likely spots.
 
+## What's new in v3
+- **Upload audio:** *Upload audio* picks an mp3/wav/m4a/ogg soundtrack that is mixed into the video from 0:00 (together with any sound the page itself makes). With a blank duration the video lasts soundtrack length + 0.4 s.
+- **Smooth live preview:** every finished 4 s segment is muxed (video + its audio) and queued into an in-app player. Because rendering is usually slower than real time, playback starts after a buffer computed from the measured render speed (max 90 s) so it does not catch up with the renderer; if it ever does, it pauses and resumes after ~3 s buffered instead of stuttering. When the render ends the player switches to the final MP4 at the same position.
+- **Faster rendering:** *Turbo* waits 1 vsync instead of 2 per frame; the next segment's encoder is started ahead of time; encoder gets throughput hints (`KEY_PRIORITY`, `KEY_OPERATING_RATE`); the render window requests the display's highest refresh rate.
+
 ## Build and install
 Requirements: Android Studio Ladybug+ (or JDK 17 + Android SDK 35), internet for the first Gradle sync.
 

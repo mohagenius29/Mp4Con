@@ -15,13 +15,18 @@ data class AudioSeg(val silence: Boolean, val srcStart: Double, val srcEnd: Doub
  * segments. Output interval k (time k/fps .. (k+1)/fps) is what advanced during step k+1.
  */
 object AudioPlanner {
-    fun plan(steps: List<StepLog>, fps: Int, totalFrames: Int, maxGroup: Int = 6): List<AudioSeg> {
-        val byFrame = HashMap<Int, StepLog>().also { m -> steps.forEach { m[it.frame] = it } }
+    fun plan(steps: List<StepLog>, fps: Int, totalFrames: Int, maxGroup: Int = 6): List<AudioSeg> =
+        planRange(steps, fps, 0, totalFrames, maxGroup)
+
+    /** Same as [plan] but only for output frames [startFrame, endFrame) (used for the live preview chunks). */
+    fun planRange(steps: List<StepLog>, fps: Int, startFrame: Int, endFrame: Int, maxGroup: Int = 6): List<AudioSeg> {
+        val totalFrames = endFrame
+        val byFrame = HashMap<Int, StepLog>().also { m -> steps.forEach { if (it.frame > startFrame && it.frame <= endFrame) m[it.frame] = it } }
         fun at(k: Int): StepLog? = byFrame[k + 1]
         fun isPlay(s: StepLog?) = s != null && s.playing && s.posAfter > s.posBefore + 1e-9
         val frameDur = 1.0 / fps
         val out = ArrayList<AudioSeg>()
-        var k = 0
+        var k = startFrame
         while (k < totalFrames) {
             val first = at(k)
             if (!isPlay(first)) {

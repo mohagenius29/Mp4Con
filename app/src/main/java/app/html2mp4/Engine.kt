@@ -21,6 +21,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -37,15 +38,19 @@ import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.math.ceil
 
 object Engine {
-    private const val SEG_SECONDS = 10      // cached segment length (resume granularity)
-    private const val SETTLE_VSYNCS = 2     // vsyncs to wait after the page painted, before PixelCopy. Lower = faster, riskier.
+    private const val SEG_SECONDS = 4       // cached segment length = resume granularity = live-preview chunk length
+    private const val SAFE_VSYNCS = 2       // vsyncs to wait after the page painted, before PixelCopy (Turbo uses 1)
     private val pcThread by lazy { HandlerThread("pixelcopy").apply { start() } }
     private val pcHandler by lazy { Handler(pcThread.looper) }
     private var vsReq = 0L
@@ -58,13 +63,15 @@ object Engine {
         RenderState.update { UiState(phase = Phase.Preparing, msg = "Preparing…", renderW = cfg.width, renderH = cfg.height) }
 
         // ---- job cache (resume) ----
-        val jobId = sha1(cfg.htmlFile, "${cfg.width}x${cfg.height}@$fps|${cfg.hideOverlays}|${cfg.autoClick}|${cfg.manualDurationSec}")
+        val jobId = sha1(cfg.htmlFile, "${cfg.width}x${cfg.height}@$fps|${cfg.hideOverlays}|${cfg.autoClick}|${cfg.manualDurationSec}|${cfg.audioFile?.length() ?: 0}")
         val jobsRoot = File(app.cacheDir, "jobs").apply { mkdirs() }
         jobsRoot.listFiles()?.filter { it.name != jobId }?.forEach { it.deleteRecursively() }
         val jobDir = File(jobsRoot, jobId).apply { mkdirs() }
         File(jobDir, "seg_000.part").delete()
         val audioFiles = withContext(Dispatchers.IO) { extractAudio(cfg.htmlFile, jobDir) }
-        AppLog.d("extracted ${audioFiles.size} embedded audio file(s)")
+        AppLog.d("extracted ${audioFiles.size} embedded audio file(s)" + (cfg.audioFile?.let { "; uploaded soundtrack ${it.name} (${"%.1f".format(cfg.audioDurSec)} s)" } ?: ""))
+        val previewDir = PreviewFeed.reset(app)
+        val previewExec = Executors.newSingleThreadExecutor()
 
         val rig = host.openRig(cfg.width, cfg.height)
         try {
@@ -118,11 +125,13 @@ object Engine {
             if (durJson.length() > 0) web.eval("Object.assign(__vc.durByKey, $durJson); 1", rig)
             web.eval("__vc.prepare(${cfg.autoClick},${cfg.hideOverlays})", rig)
             web.eval("__vc.step(0,-1)", rig); web.eval("__vc.step(0,-1)", rig)
-            settle(web); settle(web)
+            settle(web, SAFE_VSYNCS); settle(web, SAFE_VSYNCS)
 
             // ---- frame loop ----
             val manualFrames = if (cfg.manualDurationSec > 0) ceil(cfg.manualDurationSec * fps).toInt() else -1
-            val fallbackFrames = ceil(cfg.fallbackDurationSec * fps).toInt()
+            // an uploaded soundtrack sets the minimum length (its duration + tail) when no manual duration is given
+            val extFrames = if (cfg.audioFile != null && cfg.audioDurSec > 0) ceil((cfg.audioDurSec + cfg.tailSec) * fps).toInt() else 0
+            val fallbackFrames = if (extFrames > 0) extFrames else ceil(cfg.fallbackDurationSec * fps).toInt()
             val capFrames = ceil(cfg.maxDurationSec * fps).toInt()
             var endFrame = if (manualFrames > 0) manualFrames else Int.MAX_VALUE
             var audioEndSet = false
@@ -138,18 +147,96 @@ object Engine {
             var f = 0; var segIndex = 0
             var capStart = 0L; var captured = 0
 
+            class Slot(val exec: ExecutorService, val part: File, val enc: Future<SegmentEncoder>, val idx: Int)
+            fun makeSlot(idx: Int): Slot {
+                val ex = Executors.newSingleThreadExecutor()          // the encoder's EGL context lives on this one thread
+                val part = File(jobDir, "seg_%03d.part".format(idx)).also { it.delete() }
+                return Slot(ex, part, ex.submit(Callable { SegmentEncoder(cfg.width, cfg.height, fps, part) }), idx)
+            }
+            var warm: Slot? = null
+            suspend fun takeEncoder(s: Slot): Pair<Slot, SegmentEncoder> = withContext(Dispatchers.IO) {
+                try { s to s.enc.get() } catch (e: ExecutionException) {
+                    AppLog.d("encoder start failed (${e.cause?.message}); retrying once")
+                    s.exec.shutdown()
+                    val s2 = makeSlot(s.idx)
+                    try { s2 to s2.enc.get() } catch (e2: ExecutionException) { throw RenderError("Video encoder failed to start: ${e2.cause?.message}", e2.cause) }
+                }
+            }
+
+            // ---- live preview: every finished segment becomes a small MP4 (video + its audio) for the in-app player ----
+            fun byKey(k: String) = audioFiles.firstOrNull { k.startsWith(it.first) || it.first.startsWith(k) }?.second
+            class Pending(val file: File, val start: Int, val end: Int)
+            var pending: Pending? = null
+            var logPos = 0
+            var chunkNo = 0
+            val liveLog = HashMap<Int, ArrayList<StepLog>>()
+
+            fun resolveAudioFile(m: JSONObject): File? {
+                val src = m.getString("src")
+                var file: File? = when {
+                    src.startsWith("data:") -> byKey(src)
+                    src.startsWith("blob:") -> blobs.fileFor(src) ?: m.optString("key").takeIf { it.isNotEmpty() }?.let { byKey(it) }
+                    else -> map.customFile(src) ?: map.cachedFile(src)
+                }
+                if (file == null && audioFiles.size == 1) file = audioFiles[0].second
+                return file
+            }
+
+            suspend fun dispatchChunk(p: Pending) {
+                val dur = (p.end - p.start).toDouble() / fps
+                val inputs = ArrayList<Pair<File, List<AudioSeg>>>()
+                try {
+                    val meta = JSONArray(web.eval("__vc.audioMeta()", rig))
+                    if (meta.length() > 0) {
+                        val sl = JSONObject(web.eval("__vc.logSlice($logPos)", rig))
+                        logPos = sl.getInt("n")
+                        val rows = sl.getJSONArray("rows")
+                        for (i in 0 until rows.length()) {
+                            val r = rows.getJSONArray(i)
+                            liveLog.getOrPut(r.getInt(1)) { ArrayList() } += StepLog(r.getInt(0), r.getDouble(2), r.getDouble(3), r.getInt(4) == 1)
+                        }
+                        for (i in 0 until meta.length()) {
+                            val m = meta.getJSONObject(i)
+                            val file = resolveAudioFile(m) ?: continue
+                            val plan = AudioPlanner.planRange(liveLog[m.getInt("id")] ?: emptyList(), fps, p.start, p.end)
+                            if (plan.any { !it.silence }) inputs += file to plan
+                        }
+                    }
+                } catch (e: CancellationException) { throw e
+                } catch (e: Exception) { AppLog.d("preview: could not read page audio state: ${e.message}") }
+                cfg.audioFile?.let { ext ->
+                    val s0 = p.start.toDouble() / fps
+                    if (s0 < cfg.audioDurSec) inputs += ext to listOf(AudioSeg(false, s0, p.end.toDouble() / fps, dur))
+                }
+                val idx = chunkNo++
+                previewExec.execute {
+                    try {
+                        var aud: File? = null
+                        if (inputs.isNotEmpty()) {
+                            val a = File(previewDir, "a_%04d.m4a".format(idx))
+                            try { AudioRenderer.render(inputs, dur, a); aud = a } catch (e: Exception) { AppLog.d("preview chunk $idx audio failed: ${e.message}") }
+                        }
+                        val out = File(previewDir, "p_%04d.mp4".format(idx))
+                        Mux.run(listOf(Mux.Seg(p.file, 0)), fps, aud, (dur * 1_000_000).toLong(), out)
+                        aud?.delete()
+                        PreviewFeed.add(PreviewFeed.Chunk(out, dur))
+                    } catch (t: Throwable) { AppLog.d("preview chunk $idx failed: ${t.javaClass.simpleName} ${t.message}") }
+                }
+            }
+
             suspend fun stepFrame(fr: Int): JSONObject {
                 val r = web.eval("__vc.step(${fr * 1000.0 / fps},$fr)", rig)
                 if (r == "null") throw RenderError("Page script crashed during frame $fr. See log.")
                 val st = JSONObject(r)
                 lastProg = st.getDouble("prog")
+                pending?.let { if (fr >= it.end) { pending = null; dispatchChunk(it) } }
                 if (manualFrames < 0) {
                     val played = st.getInt("played")
                     if (!audioEndSet && played > 0 && st.getInt("ended") >= played && st.getInt("playing") == 0) {
-                        audioEndSet = true; endFrame = minOf(endFrame, fr + ceil(cfg.tailSec * fps).toInt())
+                        audioEndSet = true; endFrame = minOf(endFrame, maxOf(extFrames, fr + ceil(cfg.tailSec * fps).toInt()))
                         AppLog.d("audio ended at frame $fr, stopping at $endFrame")
                     } else if (!audioEndSet && played == 0 && fr + 1 >= fallbackFrames && endFrame == Int.MAX_VALUE) {
-                        endFrame = fr + 1; AppLog.d("no audio and no duration: stopping at fallback ${cfg.fallbackDurationSec}s")
+                        endFrame = fr + 1; AppLog.d("no page audio and no duration: stopping at frame $endFrame (" + (if (extFrames > 0) "uploaded soundtrack length" else "fallback ${cfg.fallbackDurationSec}s") + ")")
                     }
                 }
                 return st
@@ -161,7 +248,7 @@ object Engine {
                 val total = when { manualFrames > 0 -> manualFrames; endFrame != Int.MAX_VALUE -> endFrame; lastProg > 0.02 -> (fr / lastProg).toInt(); else -> -1 }
                 val frac = if (total > 0) (fr.toFloat() / total).coerceIn(0f, 1f) else -1f
                 val eta = if (total > 0 && rfps > 0) ((total - fr) / rfps).toLong() else -1L
-                RenderState.update { it.copy(phase = Phase.Rendering, frame = fr, fraction = frac, etaSec = eta, renderFps = rfps, msg = "Rendering", preview = thumb ?: it.preview) }
+                RenderState.update { it.copy(phase = Phase.Rendering, frame = fr, fraction = frac, etaSec = eta, renderFps = rfps, msg = "Rendering", preview = thumb ?: it.preview, fps = fps, totalFrames = total) }
             }
 
             try {
@@ -173,22 +260,25 @@ object Engine {
                         RenderState.update { it.copy(phase = Phase.Rendering, msg = "Resuming: replaying cached part ${segIndex + 1}") }
                         for (k in 0 until n) { stepFrame(f); f++ }
                         segs += Mux.Seg(cached, start); segIndex++
+                        pending = Pending(cached, start, f)
                         continue
                     }
                     val start = f
-                    val part = File(jobDir, "seg_%03d.part".format(segIndex))
-                    val exec = Executors.newSingleThreadExecutor()
-                    val enc = withContext(Dispatchers.IO) { exec.submit(Callable { SegmentEncoder(cfg.width, cfg.height, fps, part) }).get() }
+                    val cur = warm ?: makeSlot(segIndex); warm = null
+                    val (used, enc) = takeEncoder(cur)
+                    val exec = used.exec; val part = used.part
                     var ok = false
                     try {
                         if (capStart == 0L) capStart = SystemClock.elapsedRealtime()
                         while (f < endFrame && f - start < segFrames && f < capFrames) {
                             host.resumed.first { it }               // paused while the app is in the background
+                            if (warm == null && f - start == segFrames - fps && existing.getOrNull(segIndex + 1) == null && endFrame - f > fps * 2)
+                                warm = makeSlot(segIndex + 1)       // start the next encoder now so segment changes don't stall
                             stepFrame(f)
-                            settle(web)
+                            settle(web, if (cfg.turbo) 1 else SAFE_VSYNCS)
                             val bmp = free.receive()
                             copy(rig, bmp)
-                            val thumb = if (f % 6 == 0) Bitmap.createScaledBitmap(bmp, 270, (270f * cfg.height / cfg.width).toInt().coerceAtLeast(1), true) else null
+                            val thumb = if (f % 8 == 0) Bitmap.createScaledBitmap(bmp, 270, (270f * cfg.height / cfg.width).toInt().coerceAtLeast(1), true) else null
                             val pts = (f - start) * 1_000_000_000L / fps
                             exec.execute {
                                 try { enc.encode(bmp, pts) } catch (t: Throwable) { encErr.compareAndSet(null, t) }
@@ -209,11 +299,13 @@ object Engine {
                     val done = File(jobDir, "seg_%03d_%d.mp4".format(segIndex, f - start))
                     part.renameTo(done)
                     segs += Mux.Seg(done, start); segIndex++
+                    pending = Pending(done, start, f)
                     AppLog.d("segment ${segIndex} saved: ${f - start} frames")
                 }
                 stepFrame(f)                                          // one extra step so the audio log covers the last frame
             } finally {
                 while (true) { val b = free.tryReceive().getOrNull() ?: break; b.recycle() }
+                warm?.let { w -> withContext(NonCancellable + Dispatchers.IO) { runCatching { w.exec.submit { w.enc.get().abort() }.get() }; w.exec.shutdown() } }
             }
             val totalFrames = f
             val durationSec = totalFrames / fps.toDouble()
@@ -224,8 +316,8 @@ object Engine {
             var audioOut: File? = null
             var warn: String? = null
             var unresolved = 0
-            fun byKey(k: String) = audioFiles.firstOrNull { k.startsWith(it.first) || it.first.startsWith(k) }?.second
             val meta = JSONArray(web.eval("__vc.audioMeta()", rig))
+            val inputs = ArrayList<Pair<File, List<AudioSeg>>>()
             if (meta.length() > 0) {
                 val logJson = JSONArray(web.eval("__vc.log", rig, 120_000))
                 val perId = HashMap<Int, ArrayList<StepLog>>()
@@ -233,32 +325,30 @@ object Engine {
                     val r = logJson.getJSONArray(i)
                     perId.getOrPut(r.getInt(1)) { ArrayList() } += StepLog(r.getInt(0), r.getDouble(2), r.getDouble(3), r.getInt(4) == 1)
                 }
-                val inputs = ArrayList<Pair<File, List<AudioSeg>>>()
                 for (i in 0 until meta.length()) {
                     val m = meta.getJSONObject(i); val src = m.getString("src")
-                    var file: File? = when {
-                        src.startsWith("data:") -> byKey(src)
-                        src.startsWith("blob:") -> blobs.fileFor(src) ?: m.optString("key").takeIf { it.isNotEmpty() }?.let { byKey(it) }
-                        else -> map.customFile(src) ?: map.cachedFile(src)
-                    }
-                    if (file == null && audioFiles.size == 1) { file = audioFiles[0].second; AppLog.d("audio #$i: source not recognised, assuming the single embedded audio file") }
+                    val file = resolveAudioFile(m)
                     val plan = AudioPlanner.plan(perId[m.getInt("id")] ?: emptyList(), fps, totalFrames)
                     val audible = plan.any { !it.silence }
                     AppLog.d("audio #$i src=${src.take(40)} file=${file?.name} segments=${plan.size} audible=$audible")
                     if (file == null && audible) { unresolved++; AppLog.d("WARN audio #$i played but its file could not be found; it will be silent.") }
                     if (file != null && audible) inputs += file to plan
                 }
-                if (inputs.isNotEmpty()) {
-                    val out = File(jobDir, "audio.m4a")
-                    try {
-                        withContext(Dispatchers.IO) { AudioRenderer.render(inputs, durationSec, out) }
-                        audioOut = out
-                        AppLog.d("audio mixed: ${out.length() / 1024} KB for ${"%.1f".format(durationSec)} s")
-                    } catch (e: kotlinx.coroutines.CancellationException) { throw e
-                    } catch (e: Exception) {
-                        AppLog.d("audio render failed, saving the video without sound: ${e.message}")
-                        warn = "The audio could not be mixed (${e.message}), so the video has no sound. See log."
-                    }
+            }
+            cfg.audioFile?.let { ext ->
+                inputs += ext to listOf(AudioSeg(false, 0.0, durationSec, durationSec))
+                AppLog.d("audio: uploaded soundtrack ${ext.name} mixed in from 0 s")
+            }
+            if (inputs.isNotEmpty()) {
+                val out = File(jobDir, "audio.m4a")
+                try {
+                    withContext(Dispatchers.IO) { AudioRenderer.render(inputs, durationSec, out) }
+                    audioOut = out
+                    AppLog.d("audio mixed: ${out.length() / 1024} KB for ${"%.1f".format(durationSec)} s")
+                } catch (e: CancellationException) { throw e
+                } catch (e: Exception) {
+                    AppLog.d("audio render failed, saving the video without sound: ${e.message}")
+                    warn = "The audio could not be mixed (${e.message}), so the video has no sound. See log."
                 }
             }
             if (audioOut == null && warn == null) {
@@ -274,10 +364,12 @@ object Engine {
             withContext(Dispatchers.IO) { Mux.run(segs, fps, audioOut, totalFrames * 1_000_000L / fps, finalFile) }
             val name = cfg.displayName.substringBeforeLast('.').replace(Regex("[^A-Za-z0-9_-]"), "_") + "_${cfg.width}x${cfg.height}_${System.currentTimeMillis() / 1000}.mp4"
             val uri = withContext(Dispatchers.IO) { Saver.save(app, finalFile, name) }
+            withContext(Dispatchers.IO) { previewExec.shutdown(); previewExec.awaitTermination(30, TimeUnit.SECONDS) }
             jobDir.deleteRecursively()
             AppLog.d("saved $uri")
             return uri
         } finally {
+            previewExec.shutdownNow()
             host.closeRig()
         }
     }
@@ -295,13 +387,13 @@ object Engine {
     private suspend fun vsync() = suspendCancellableCoroutine<Unit> { c -> Choreographer.getInstance().postFrameCallback { if (c.isActive) c.resume(Unit) } }
 
     /** After the page ran its frame callbacks: wait until Chromium has painted them, then a couple of vsyncs so the window surface holds them. */
-    private suspend fun settle(web: WebView) {
+    private suspend fun settle(web: WebView, vsyncs: Int) {
         withTimeoutOrNull(2_000) {
             suspendCancellableCoroutine<Unit> { c ->
                 web.postVisualStateCallback(++vsReq, object : WebView.VisualStateCallback() { override fun onComplete(requestId: Long) { if (c.isActive) c.resume(Unit) } })
             }
         }
-        repeat(SETTLE_VSYNCS) { vsync() }
+        repeat(vsyncs) { vsync() }
     }
 
     private suspend fun copy(rig: Rig, bmp: Bitmap) {

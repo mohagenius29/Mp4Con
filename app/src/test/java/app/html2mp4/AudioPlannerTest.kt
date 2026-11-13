@@ -40,4 +40,15 @@ class AudioPlannerTest {
         assertEquals(2, plan.size)
         assertTrue(abs(plan[1].srcStart - 5.0) < 1e-9)
     }
+
+    /** Preview chunks plan only their own frame range, and the ranges tile exactly into the full plan. */
+    @Test fun rangeMatchesFullPlan() {
+        val steps = (1..61).map { f -> StepLog(f, (f - 1) / fps.toDouble(), f / fps.toDouble(), true) }
+        val a = AudioPlanner.planRange(steps, fps, 0, 30)
+        val b = AudioPlanner.planRange(steps, fps, 30, 60)
+        assertEquals(30.0 / fps, a.sumOf { it.outDur }, 1e-9)
+        assertEquals(30.0 / fps, b.sumOf { it.outDur }, 1e-9)
+        assertEquals(30.0 / fps, b.first().srcStart, 1e-9)       // second chunk starts where the first stopped
+        assertEquals(60.0 / fps, b.last().srcEnd, 1e-9)
+    }
 }

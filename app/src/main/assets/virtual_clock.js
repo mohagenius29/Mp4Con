@@ -185,6 +185,8 @@
       return { id: i, src: s.indexOf('data:') === 0 ? s.slice(0, 60) : s, key: vc.blobKeys[s] || '', dur: durOf(el) || 0 }; });
   };
 
+  vc.logSlice = function (from) { return { n: vc.log.length, rows: vc.log.slice(from) }; };
+
   /* Advance to absolute virtual time t (ms) for frame index f. Returns a small state object. */
   vc.step = function (t, f) {
     var dt = Math.max(0, t - vc.t); vc.prev = vc.t; vc.t = t;

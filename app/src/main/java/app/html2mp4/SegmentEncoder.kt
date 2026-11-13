@@ -13,6 +13,7 @@ import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.opengl.GLUtils
+import android.os.Build
 import android.view.Surface
 import java.io.File
 import java.nio.ByteBuffer
@@ -45,6 +46,11 @@ class SegmentEncoder(private val w: Int, private val h: Int, fps: Int, private v
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            // Offline encode: ask the codec for throughput, not real-time pacing (ignored by codecs that don't support it).
+            if (Build.VERSION.SDK_INT >= 23) {
+                setInteger(MediaFormat.KEY_PRIORITY, 1)
+                setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
+            }
         }
         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = codec.createInputSurface()

@@ -11,8 +11,8 @@ android {
         applicationId = "app.html2mp4"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // The maintained ffmpeg-kit fork only publishes arm64-v8a.
         ndk { abiFilters += listOf("arm64-v8a") }
@@ -39,6 +39,8 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.webkit:webkit:1.12.1")
+    // in-app smooth preview player
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     // ffmpeg: if you drop the paid Full-GPL AAR (has the `rubberband` filter) into app/libs it is used
