@@ -16,6 +16,7 @@ object Mux {
 
     fun run(segs: List<Seg>, fps: Int, audio: File?, durationUs: Long, out: File) {
         require(segs.isNotEmpty()) { "no video segments" }
+        AppLog.d("mux: ${segs.size} video segment(s), audio=${audio?.name ?: "none"} ${audio?.length() ?: 0} bytes")
         val muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         var vEx: MediaExtractor? = null
         var aEx: MediaExtractor? = null

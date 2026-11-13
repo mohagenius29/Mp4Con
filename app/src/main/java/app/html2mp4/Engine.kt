@@ -253,6 +253,7 @@ object Engine {
                     try {
                         withContext(Dispatchers.IO) { AudioRenderer.render(inputs, durationSec, out) }
                         audioOut = out
+                        AppLog.d("audio mixed: ${out.length() / 1024} KB for ${"%.1f".format(durationSec)} s")
                     } catch (e: kotlinx.coroutines.CancellationException) { throw e
                     } catch (e: Exception) {
                         AppLog.d("audio render failed, saving the video without sound: ${e.message}")

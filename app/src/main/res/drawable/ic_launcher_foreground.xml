@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "< ▶ >": HTML brackets around a play button. Everything sits inside the 66dp adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- left bracket < -->
+    <path
+        android:pathData="M34,40 L22,54 L34,68"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <!-- right bracket > -->
+    <path
+        android:pathData="M74,40 L86,54 L74,68"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <!-- play triangle -->
+    <path
+        android:pathData="M45,41 L45,67 L65,54 Z"
+        android:fillColor="#FFFF8A5B"
+        android:strokeColor="#FFFF8A5B"
+        android:strokeWidth="3"
+        android:strokeLineJoin="round" />
+</vector>
